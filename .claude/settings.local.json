@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(timeout:*)",
+      "Bash(ping:*)",
+      "Bash(curl:*)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:shopify.github.io)",
+      "WebFetch(domain:community.shopify.com)",
+      "WebFetch(domain:shopify.dev)",
+      "WebFetch(domain:help.shopify.com)",
+      "WebFetch(domain:community.shopify.dev)",
+      "WebFetch(domain:bpe-help-center.hextom.com)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

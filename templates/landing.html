@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Listing Cannon - AI-Powered Product Upload</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="{{ url_for('static', filename='style.css') }}?v=3" rel="stylesheet">
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg" style="background: #fff; border-bottom: 1px solid #e3e8ee;">
+        <div class="container">
+            <a class="navbar-brand h1 mb-0 fw-bold" href="{{ url_for('index') }}" style="color: #0a2540; font-size: 1.15rem;">
+                <i class="fas fa-rocket me-2" style="color: #635bff;"></i>
+                Listing Cannon
+            </a>
+            
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="#features" style="color: #596773; font-weight: 500;">Features</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#how-it-works" style="color: #596773; font-weight: 500;">How It Works</a>
+                    </li>
+                </ul>
+                
+                <div class="d-flex align-items-center gap-3">
+                    {% if registration_enabled %}
+                    <a href="{{ url_for('register') }}" class="btn btn-outline-primary" style="font-size: 0.9rem;">
+                        Create Account
+                    </a>
+                    {% endif %}
+                    <a href="{{ url_for('login') }}" class="btn btn-primary" style="font-size: 0.9rem;">
+                        Log In
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero-section">
+        <div class="container">
+            <div class="row align-items-center">
+                <div class="col-lg-6">
+                    <h1 class="display-4 fw-bold mb-4" style="color: #0a2540; letter-spacing: -0.02em;">
+                        Listing Cannon
+                    </h1>
+                    <p class="lead mb-4" style="color: #596773; font-size: 1.15rem; line-height: 1.7;">
+                        Fire your products into Shopify at lightning speed. Transform images into complete product listings with AI-generated metadata, automatic variants, and professional framing -- all in minutes.
+                    </p>
+                    <div class="d-flex gap-3">
+                        {% if registration_enabled %}
+                        <a href="{{ url_for('register') }}" class="btn btn-primary cta-button">
+                            <i class="fas fa-rocket me-2"></i>
+                            Get Started Now
+                        </a>
+                        {% else %}
+                        <a href="{{ url_for('login') }}" class="btn btn-primary cta-button">
+                            <i class="fas fa-sign-in-alt me-2"></i>
+                            Log In
+                        </a>
+                        {% endif %}
+                        <button class="btn btn-outline-secondary btn-lg" onclick="scrollToFeatures()" style="border-radius: 8px; font-weight: 500;">
+                            Learn More
+                        </button>
+                    </div>
+                </div>
+                <div class="col-lg-6">
+                    <div class="text-center">
+                        <i class="fas fa-rocket" style="font-size: 12rem; color: rgba(99, 91, 255, 0.08);"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="py-5" style="background: #f7f8fa;">
+        <div class="container">
+            <div class="row">
+                <div class="col-12 text-center mb-5">
+                    <h2 class="display-5 fw-bold" style="color: #0a2540;">Powerful Features</h2>
+                    <p class="lead" style="color: #596773;">Everything you need to automate your Shopify product creation</p>
+                </div>
+            </div>
+            <div class="row g-4">
+                <div class="col-md-4">
+                    <div class="card h-100 border-0" style="background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
+                        <div class="card-body text-center p-4">
+                            <i class="fas fa-brain feature-icon"></i>
+                            <h5 class="card-title fw-bold" style="color: #0a2540;">AI-Generated Metadata</h5>
+                            <p class="card-text" style="color: #596773;">Gemini 2.5 Flash analyzes your images to create compelling product titles, descriptions, and tags automatically.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card h-100 border-0" style="background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
+                        <div class="card-body text-center p-4">
+                            <i class="fas fa-palette feature-icon"></i>
+                            <h5 class="card-title fw-bold" style="color: #0a2540;">Professional Framing</h5>
+                            <p class="card-text" style="color: #596773;">Apply beautiful PSD frames to your artwork or upload ready-framed images directly to Shopify.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card h-100 border-0" style="background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
+                        <div class="card-body text-center p-4">
+                            <i class="fas fa-shopping-cart feature-icon"></i>
+                            <h5 class="card-title fw-bold" style="color: #0a2540;">Instant Shopify Upload</h5>
+                            <p class="card-text" style="color: #596773;">Complete product listings with multiple variants, collections, and optimized images uploaded automatically.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card h-100 border-0" style="background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
+                        <div class="card-body text-center p-4">
+                            <i class="fas fa-layers feature-icon"></i>
+                            <h5 class="card-title fw-bold" style="color: #0a2540;">Multiple Variants</h5>
+                            <p class="card-text" style="color: #596773;">Automatic size variants (A4, A3, A2, A1) with smart pricing in multiple currencies (GBP, USD, EUR).</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card h-100 border-0" style="background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
+                        <div class="card-body text-center p-4">
+                            <i class="fas fa-tags feature-icon"></i>
+                            <h5 class="card-title fw-bold" style="color: #0a2540;">Collections</h5>
+                            <p class="card-text" style="color: #596773;">AI automatically assigns products to relevant Shopify collections based on image analysis and your custom instructions.</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="card h-100 border-0" style="background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06);">
+                        <div class="card-body text-center p-4">
+                            <i class="fas fa-bolt feature-icon"></i>
+                            <h5 class="card-title fw-bold" style="color: #0a2540;">Bulk Processing</h5>
+                            <p class="card-text" style="color: #596773;">Upload multiple images at once and process them in batches for maximum efficiency.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA Section -->
+    <section class="py-5" style="background: #fff;">
+        <div class="container">
+            <div class="row">
+                <div class="col-12 text-center">
+                    <h3 class="fw-bold mb-3" style="color: #0a2540;">Ready to Transform Your Workflow?</h3>
+                    <p class="mb-4" style="color: #596773;">Join thousands of creators who save hours every week with AI automation</p>
+                    <a href="{{ url_for('register') }}" class="btn btn-primary cta-button">
+                        <i class="fas fa-user-plus me-2"></i>
+                        Create Account Now
+                    </a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="py-4" style="background: #f7f8fa; border-top: 1px solid #e3e8ee;">
+        <div class="container">
+            <div class="row">
+                <div class="col-12 text-center">
+                    <p class="mb-0" style="color: #8898a6; font-size: 0.875rem;">&copy; 2025 Listing Cannon. Powered by AI.</p>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function scrollToFeatures() {
+            document.getElementById('features').scrollIntoView({ behavior: 'smooth' });
+        }
+    </script>
+</body>
+</html>

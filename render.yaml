@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: listing-cannon
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    # Run DB migrations (adds missing columns like vendor_manual; safe to run every deploy)
+    releaseCommand: python migrate_profile_seo_columns.py && python migrate_saved_profile_prompt.py
+    # Must use config file so PORT is read in Python (Render does not expand $PORT in start command)
+    startCommand: gunicorn -c gunicorn.conf.py app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: listing-cannon-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: REGISTRATION_ENABLED
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+      # Optional: for single-store (Custom app) without OAuth, set in Render dashboard:
+      # SHOP_DOMAIN (e.g. your-store.myshopify.com), SHOPIFY_ACCESS_TOKEN
+
+databases:
+  - name: listing-cannon-db
+    plan: free

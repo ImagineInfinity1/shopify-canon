@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account - Listing Cannon</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="{{ url_for('static', filename='style.css') }}?v=3" rel="stylesheet">
+</head>
+<body>
+    <div class="auth-container py-5">
+        <div class="container">
+            <div class="row justify-content-center">
+                <div class="col-md-6 col-lg-5">
+                    <div class="auth-card p-4">
+                        <div class="text-center mb-4">
+                            <h1 class="auth-brand mb-3" style="font-size: 1.5rem;">
+                                <i class="fas fa-user-cog me-2" style="color: #635bff;"></i>
+                                Account
+                            </h1>
+                            <p class="text-muted">View and edit your profile</p>
+                        </div>
+
+                        {% with messages = get_flashed_messages(with_categories=true) %}
+                            {% if messages %}
+                                {% for category, message in messages %}
+                                    <div class="alert alert-{{ 'danger' if category == 'error' else category }} alert-dismissible fade show" role="alert">
+                                        {{ message }}
+                                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                                    </div>
+                                {% endfor %}
+                            {% endif %}
+                        {% endwith %}
+
+                        <form method="POST" action="{{ url_for('account') }}">
+                            <input type="hidden" name="action" value="update_profile">
+                            <div class="mb-3">
+                                <label class="form-label">Username</label>
+                                <input type="text" class="form-control" value="{{ current_user.username }}" disabled>
+                            </div>
+                            <div class="mb-3">
+                                <label for="email" class="form-label">Email</label>
+                                <input type="email" class="form-control" id="email" name="email" value="{{ current_user.email or '' }}" required>
+                            </div>
+                            <div class="row mb-3">
+                                <div class="col">
+                                    <label for="first_name" class="form-label">First name</label>
+                                    <input type="text" class="form-control" id="first_name" name="first_name" value="{{ current_user.first_name or '' }}">
+                                </div>
+                                <div class="col">
+                                    <label for="last_name" class="form-label">Last name</label>
+                                    <input type="text" class="form-control" id="last_name" name="last_name" value="{{ current_user.last_name or '' }}">
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary w-100 mb-4">Save profile</button>
+                        </form>
+
+                        <hr class="my-4" style="border-color: #e3e8ee;">
+
+                        <!-- Shopify Store Connection -->
+                        <h6 class="mb-3 fw-bold"><i class="fas fa-store me-2" style="color: #96bf48;"></i>Shopify Store</h6>
+                        {% if shops and shops|length > 0 %}
+                            {% for shop in shops %}
+                            <div class="d-flex align-items-center justify-content-between p-3 mb-2" style="background: #f0f9f0; border-radius: 8px; border: 1px solid #c3e6c3;">
+                                <div>
+                                    <span class="fw-semibold" style="color: #1a7a45;">
+                                        <i class="fas fa-check-circle me-1"></i>
+                                        {{ shop.shop_name or shop.shop_domain }}
+                                    </span>
+                                    <br>
+                                    <small class="text-muted">{{ shop.shop_domain }}</small>
+                                </div>
+                                <form method="POST" action="{{ url_for('shopify_disconnect') }}" style="margin:0;">
+                                    <input type="hidden" name="shop_id" value="{{ shop.id }}">
+                                    <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Disconnect this store?')">
+                                        <i class="fas fa-unlink me-1"></i>Disconnect
+                                    </button>
+                                </form>
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <div class="p-3 mb-2 text-center" style="background: #fff8e6; border-radius: 8px; border: 1px solid #ffe0a3;">
+                                <i class="fas fa-exclamation-triangle me-1" style="color: #b8860b;"></i>
+                                <span style="color: #8a6d0b;">No Shopify store connected</span>
+                            </div>
+                        {% endif %}
+                        <form action="{{ url_for('shopify_connect') }}" method="GET" class="mb-3">
+                            <div class="input-group">
+                                <input type="text" class="form-control" name="shop" placeholder="your-store.myshopify.com" required>
+                                <button class="btn btn-success" type="submit">
+                                    <i class="fas fa-plug me-1"></i>Connect
+                                </button>
+                            </div>
+                            <small class="text-muted">Enter your Shopify store domain (e.g. my-store.myshopify.com)</small>
+                        </form>
+
+                        <hr class="my-4" style="border-color: #e3e8ee;">
+
+                        <h6 class="mb-3 fw-bold">Change password</h6>
+                        <form method="POST" action="{{ url_for('account') }}">
+                            <input type="hidden" name="action" value="change_password">
+                            <div class="mb-2">
+                                <label for="current_password" class="form-label small">Current password</label>
+                                <div class="input-group">
+                                    <input type="password" class="form-control" id="current_password" name="current_password" placeholder="Current password">
+                                    <button type="button" class="btn btn-outline-secondary toggle-pw" data-target="current_password" title="Show/hide password"><i class="fas fa-eye"></i></button>
+                                </div>
+                            </div>
+                            <div class="mb-2">
+                                <label for="new_password" class="form-label small">New password</label>
+                                <div class="input-group">
+                                    <input type="password" class="form-control" id="new_password" name="new_password" placeholder="At least 6 characters">
+                                    <button type="button" class="btn btn-outline-secondary toggle-pw" data-target="new_password" title="Show/hide password"><i class="fas fa-eye"></i></button>
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label for="confirm_password" class="form-label small">Confirm new password</label>
+                                <div class="input-group">
+                                    <input type="password" class="form-control" id="confirm_password" name="confirm_password" placeholder="Confirm">
+                                    <button type="button" class="btn btn-outline-secondary toggle-pw" data-target="confirm_password" title="Show/hide password"><i class="fas fa-eye"></i></button>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-outline-primary w-100">Update password</button>
+                        </form>
+
+                        <div class="text-center mt-4">
+                            <a href="{{ url_for('index') }}" class="text-muted text-decoration-none"><i class="fas fa-arrow-left me-1"></i>Back to app</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.querySelectorAll('.toggle-pw').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var id = this.getAttribute('data-target');
+                var input = document.getElementById(id);
+                var icon = this.querySelector('i');
+                if (input.type === 'password') { input.type = 'text'; icon.classList.replace('fa-eye', 'fa-eye-slash'); }
+                else { input.type = 'password'; icon.classList.replace('fa-eye-slash', 'fa-eye'); }
+            });
+        });
+    </script>
+</body>
+</html>

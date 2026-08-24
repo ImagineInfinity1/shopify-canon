@@ -1,0 +1,28 @@
+# Shopify Automation Tool - Dependencies
+
+# Web Framework
+Flask>=2.0.0
+Flask-Login>=0.6.0
+gunicorn>=21.0.0
+
+# Image Processing
+Pillow>=9.0.0
+psd-tools>=1.9.0
+PhotoshopAPI>=0.9.1
+
+# AI Integration (new unified SDK: from google import genai)
+google-genai>=1.0.0
+
+# HTTP Requests
+requests>=2.28.0
+tkinterdnd2>=0.4.3
+
+# Security
+Werkzeug>=2.0.0
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Database (optional)
+Flask-SQLAlchemy>=3.0.0
+psycopg2-binary>=2.9.0

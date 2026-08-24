@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv-packaging/
+dist/
+build/
+# PyInstaller / installer build outputs (keep the .spec and .iss scripts, not the binaries)
+dist-fixed/
+build-fixed/
+*.exe
+installer/Output/
+
+# Environment variables (CRITICAL - contains API keys)
+.env
+.env.local
+.env.*.local
+
+# Flask
+instance/
+.webassets-cache
+
+# Logs
+*.log
+app.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Upload folders (user data) - CRITICAL: Do not commit user uploads
+uploads/
+processed/
+psd_frames/
+psd_frames_disabled/
+attached_assets/
+**/uploads/**
+**/processed/**
+**/psd_frames/**
+**/psd_frames_disabled/**
+**/attached_assets/**
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+*.psd
+*.psb
+
+# IDE / editor
+.vscode/
+.idea/
+.cursor/
+.local/
+src/main/java/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+test_*.jpg
+test_*.py
+test_*.html
+test.psd
+
+# Temporary/backup files
+*_backup.py
+temp_*_backup.py
+*.bak
+cookies.txt
+local_worker/frame_order.json
+
+# Replit artifacts
+.replit
+replit.md
+replit_auth.py
+nul
