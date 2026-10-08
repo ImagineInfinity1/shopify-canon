@@ -670,12 +670,12 @@ def _rewrite_meta_description_with_ai(metadata, previous_value=""):
             return gemini_client.models.generate_content(
                 model="gemini-3.1-flash-lite",
                 contents=[prompt],
-                config=types.GenerateContentConfig(
+                config=_gemini_config("gemini-3.1-flash-lite", types.GenerateContentConfig(
                     response_mime_type="application/json",
                     max_output_tokens=512,
                     thinking_config=types.ThinkingConfig(thinking_budget=128),
                     temperature=0.35,
-                ),
+                )),
             )
 
         timeout_s = int(os.environ.get("GEMINI_SEO_REPAIR_TIMEOUT_S", "10"))
@@ -1009,6 +1009,48 @@ def get_client():
     return client
 
 
+_GEMINI_VERSION_RE = re.compile(r"gemini-(\d+)\.(\d+)")
+
+
+def _gemini_version(model):
+    match = _GEMINI_VERSION_RE.search(str(model or "").lower())
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _thinking_level_for_budget(budget):
+    if budget <= 128:
+        return "minimal"
+    if budget <= 512:
+        return "low"
+    if budget <= 4096:
+        return "medium"
+    return "high"
+
+
+def _gemini_config(model, config):
+    """Drop settings that newer Gemini models reject (Google notice, Oct 2026).
+
+    temperature/top_p/top_k have had no effect since Gemini 3.6 and upcoming
+    models will reject them, so they are left out from 3.6 on. thinking_budget
+    is still accepted by every released 3.x model, so it is only swapped for
+    thinking_level on models newer than 3.6. Older models get the config as is.
+    """
+    version = _gemini_version(model)
+    if version is None:
+        return config
+    update = {}
+    if version >= (3, 6):
+        update.update(temperature=None, top_p=None, top_k=None)
+    thinking = config.thinking_config
+    if version > (3, 6) and thinking is not None and thinking.thinking_budget is not None:
+        budget = thinking.thinking_budget
+        update["thinking_config"] = (
+            types.ThinkingConfig(thinking_level=_thinking_level_for_budget(budget))
+            if budget >= 0 else None
+        )
+    return config.model_copy(update=update) if update else config
+
+
 def curate_listing_discovery_with_ai(metadata, candidate_products=None, max_related=4, max_complementary=4):
     """Use Gemini to choose search boosts and discovery recommendations from real candidates.
 
@@ -1109,12 +1151,12 @@ def curate_listing_discovery_with_ai(metadata, candidate_products=None, max_rela
             return gemini_client.models.generate_content(
                 model="gemini-3.1-flash-lite",
                 contents=[prompt],
-                config=types.GenerateContentConfig(
+                config=_gemini_config("gemini-3.1-flash-lite", types.GenerateContentConfig(
                     response_mime_type="application/json",
                     max_output_tokens=2048,
                     thinking_config=types.ThinkingConfig(thinking_budget=256),
                     temperature=0.2,
-                ),
+                )),
             )
 
         timeout_s = int(os.environ.get("GEMINI_DISCOVERY_TIMEOUT_S", "12"))
@@ -1620,7 +1662,7 @@ Return only JSON in this form:
                         ),
                         category_prompt
                     ],
-                    config=types.GenerateContentConfig(
+                    config=_gemini_config("gemini-3.1-flash-lite", types.GenerateContentConfig(
                         response_mime_type="application/json",
                         # Bound thinking + output so Flash-Lite cannot overrun the worker.
                         # 8192 is ample for the JSON; thinking_budget caps slow reasoning
@@ -1628,7 +1670,7 @@ Return only JSON in this form:
                         max_output_tokens=8192,
                         thinking_config=types.ThinkingConfig(thinking_budget=1024),
                         temperature=0.1  # Lower temperature for more consistent categorization
-                    )
+                    ))
                 )
             
             try:
@@ -1748,7 +1790,7 @@ def generate_product_metadata(image_path, custom_prompt="", available_collection
                         ),
                         prompt
                     ],
-                    config=types.GenerateContentConfig(
+                    config=_gemini_config(selected_model, types.GenerateContentConfig(
                         response_mime_type="application/json",
                         # Bound thinking+output so the analysis step stays short
                         # enough for Render free tier status polling.
@@ -1757,7 +1799,7 @@ def generate_product_metadata(image_path, custom_prompt="", available_collection
                             thinking_budget=int(os.environ.get("GEMINI_MAIN_THINKING_BUDGET", "512"))
                         ),
                         temperature=0.7
-                    )
+                    ))
                 )
             
             try:
@@ -2177,7 +2219,7 @@ Attributes:
                     ),
                     prompt
                 ],
-                config=types.GenerateContentConfig(
+                config=_gemini_config("gemini-3.1-flash-lite", types.GenerateContentConfig(
                     response_mime_type="application/json",
                     # Small JSON only; category enrichment should not block
                     # product creation if Gemini is slow.
@@ -2186,7 +2228,7 @@ Attributes:
                         thinking_budget=int(os.environ.get("GEMINI_CATEGORY_PICK_THINKING_BUDGET", "128"))
                     ),
                     temperature=0.1
-                )
+                ))
             )
 
         try:
@@ -2287,12 +2329,12 @@ def generate_collection_metadata(collection, custom_prompt="", model_name="gemin
     response = gemini_client.models.generate_content(
         model=model_name or "gemini-3.1-flash-lite",
         contents=[prompt],
-        config=types.GenerateContentConfig(
+        config=_gemini_config(model_name or "gemini-3.1-flash-lite", types.GenerateContentConfig(
             response_mime_type="application/json",
             max_output_tokens=1400,
             thinking_config=types.ThinkingConfig(thinking_budget=256),
             temperature=0.4,
-        ),
+        )),
     )
     if not response or not response.text:
         raise ValueError("The AI returned nothing for this collection.")
@@ -2395,12 +2437,12 @@ def generate_tag_cleanup_plan(tags, case_style="sentence", merge_mode="synonyms"
     response = gemini_client.models.generate_content(
         model=model_name or "gemini-3.1-flash-lite",
         contents=[prompt],
-        config=types.GenerateContentConfig(
+        config=_gemini_config(model_name or "gemini-3.1-flash-lite", types.GenerateContentConfig(
             response_mime_type="application/json",
             max_output_tokens=8192,
             thinking_config=types.ThinkingConfig(thinking_budget=512),
             temperature=0.1,
-        ),
+        )),
     )
     if not response or not response.text:
         raise ValueError("The AI returned nothing for this batch of tags.")
@@ -2496,12 +2538,12 @@ def generate_collection_groups(tags, minimum_products=8, custom_prompt="",
     response = gemini_client.models.generate_content(
         model=model_name or "gemini-3.1-flash-lite",
         contents=[prompt],
-        config=types.GenerateContentConfig(
+        config=_gemini_config(model_name or "gemini-3.1-flash-lite", types.GenerateContentConfig(
             response_mime_type="application/json",
             max_output_tokens=16384,
             thinking_config=types.ThinkingConfig(thinking_budget=1024),
             temperature=0.3,
-        ),
+        )),
     )
     if not response or not response.text:
         raise ValueError("The AI returned nothing when grouping tags into collections.")
@@ -2593,12 +2635,12 @@ def choose_products_for_collection(collection_title, collection_summary, product
     response = gemini_client.models.generate_content(
         model=model_name or "gemini-3.1-flash-lite",
         contents=[prompt],
-        config=types.GenerateContentConfig(
+        config=_gemini_config(model_name or "gemini-3.1-flash-lite", types.GenerateContentConfig(
             response_mime_type="application/json",
             max_output_tokens=8192,
             thinking_config=types.ThinkingConfig(thinking_budget=256),
             temperature=0.1,
-        ),
+        )),
     )
     if not response or not response.text:
         raise ValueError("The AI returned nothing when sorting products into '%s'." % collection_title)
