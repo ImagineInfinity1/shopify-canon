@@ -11392,6 +11392,8 @@
         let originalCsvData = null;
         let csvEnhanceSource = 'csv';
         let csvEnhanceJobId = null;
+        let bulkResultPage = 1;
+        const BULK_RESULT_PAGE_SIZE = 50;
         let csvEnhancePollTimer = null;
         let csvEnhanceTotalCount = 0;
         let csvEnhanceFailedCount = 0;
@@ -13684,61 +13686,10 @@
 
         function buildEditableVariants(product) {
             const defaultLocationId = getDefaultInventoryLocationId();
-            const handleSeed = String(product.handle || product.title || 'poster').toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, 24) || 'POSTER';
-            const sourceVariants = product.variants || [];
-            const weakSingleDefault = sourceVariants.length === 1 &&
-                ['default title', 'default', ''].includes(String(sourceVariants[0].title || sourceVariants[0].option1_value || '').trim().toLowerCase()) &&
-                ['', '0', '0.00'].includes(String(sourceVariants[0].price || product.variant_price || '').trim());
-            if (weakSingleDefault) {
-                const defaults = [
-                    ['20x30 cm', '6.99'],
-                    ['30x40 cm', '11.99'],
-                    ['40x50 cm', '12.99'],
-                    ['50x70 cm', '13.99'],
-                    ['A1 - 59.4 x 84.1 cm', '14.99'],
-                    ['A2 - 42 x 59.4 cm', '13.49'],
-                    ['A3 - 29.7 x 42 cm', '11.99'],
-                    ['A4 - 21 x 29.7 cm', '6.99']
-                ];
-                return defaults.map((entry, index) => ({
-                    title: entry[0],
-                    sku: handleSeed + '-V' + (index + 1),
-                    barcode: '',
-                    price: entry[1],
-                    compare_at_price: '',
-                    inventory_quantity: 999,
-                    inventory_item_id: '',
-                    inventory_location_id: defaultLocationId,
-                    apply_inventory: !!defaultLocationId,
-                    inventory_policy: 'CONTINUE',
-                    taxable: true,
-                    option1_name: 'Size',
-                    option1_value: entry[0],
-                    option2_name: '',
-                    option2_value: '',
-                    option3_name: '',
-                    option3_value: ''
-                }));
-            }
             return (product.variants || []).map(variant => ({
-                id: variant.id || '',
-                title: variant.title || '',
-                sku: variant.sku || (handleSeed + '-V' + ((product.variants || []).indexOf(variant) + 1)),
-                barcode: variant.barcode || '',
-                price: variant.price || '',
-                compare_at_price: variant.compare_at_price || '',
-                inventory_quantity: variant.inventory_quantity ?? 999,
-                inventory_item_id: variant.inventory_item_id || '',
-                inventory_location_id: defaultLocationId,
-                apply_inventory: false,
-                inventory_policy: variant.inventory_policy || 'CONTINUE',
-                taxable: variant.taxable ?? '',
-                option1_name: variant.option1_name || '',
-                option1_value: variant.option1_value || '',
-                option2_name: variant.option2_name || '',
-                option2_value: variant.option2_value || '',
-                option3_name: variant.option3_name || '',
-                option3_value: variant.option3_value || ''
+                ...variant,
+                inventory_location_id: variant.inventory_location_id || defaultLocationId,
+                apply_inventory: false
             }));
         }
 
@@ -13751,25 +13702,11 @@
         }
 
         function buildEditablePriceLists(product) {
-            const variants = product.variants || [];
-            const pricedVariants = variants
-                .filter(variant => variant.id && variant.price)
-                .map(variant => ({
-                    variant_id: variant.id,
-                    source_price: variant.price,
-                    source_compare_at_price: variant.compare_at_price || ''
-                }));
-            if (!pricedVariants.length) return [];
-            return (bulkPriceLists || []).map(priceList => ({
-                price_list_id: priceList.id || '',
-                name: priceList.name || priceList.catalog_title || '',
-                currency: priceList.currency || '',
-                prices: pricedVariants.map(variant => ({
-                    variant_id: variant.variant_id,
-                    price: variant.source_price,
-                    compare_at_price: variant.source_compare_at_price
-                }))
-            }));
+            // Unknown market prices are never inferred from the base currency.
+            try {
+                const prices = JSON.parse(product.price_lists_json || '[]');
+                return Array.isArray(prices) ? prices : [];
+            } catch (error) { return []; }
         }
 
         function getDynamicMetafieldColumns(products) {
@@ -13976,7 +13913,8 @@
                 variant_sku: 'sku', variant_barcode: 'barcode', variant_price: 'price',
                 variant_compare_at_price: 'compare_at_price', variant_inventory_quantity: 'inventory_quantity',
                 variant_inventory_policy: 'inventory_policy', variant_taxable: 'taxable',
-                variant_weight: 'weight', variant_weight_unit: 'weight_unit'
+                variant_weight: 'weight', variant_weight_unit: 'weight_unit',
+                variant_apply_inventory: 'apply_inventory', variant_inventory_location_id: 'inventory_location_id'
             };
             const variantKey = fieldMap[field];
             if (!variantKey) return;
@@ -14029,6 +13967,10 @@
         }
 
         function createBulkRuleChangeProposal() {
+            bulkResultPage = 1;
+            csvEnhanceJobId = null;
+            if (csvEnhancePollTimer) clearTimeout(csvEnhancePollTimer);
+            try { localStorage.removeItem('listingCannonBulkSeoJobId'); } catch (e) {}
             const field = document.getElementById('bulk-change-field')?.value || '';
             const preserveWeight = !!document.getElementById('bulk-change-convert-weight')?.checked;
             const value = field === '__all_variant_weight_unit'
@@ -14433,6 +14375,7 @@
             })
             .then(response => response.json())
             .then(data => {
+                if (!data.success && !Array.isArray(data.results)) throw new Error(data.error || 'Shopify update failed');
                 if (statusEl) {
                     const failed = data.failed_count || 0;
                     const success = data.success_count || 0;
@@ -14462,14 +14405,20 @@
             updateBulkSelectionSummary(getFilteredBulkProducts());
         }
 
-        function cancelBulkEnhancements() {
-            if (csvEnhanceProcessedData.length && !confirm('Discard the generated/editable changes? Your Shopify products will not be changed.')) {
-                return;
+        async function cancelBulkEnhancements() {
+            if ((csvEnhanceJobId || csvEnhanceProcessedData.length) && !confirm('Stop this batch and discard displayed proposals? The current product may finish. Shopify changes already applied remain saved.')) return;
+            if (csvEnhanceJobId) {
+                try {
+                    const response = await fetch('/api/bulk_seo_jobs/' + csvEnhanceJobId + '/cancel', {method: 'POST'});
+                    const result = await response.json();
+                    if (!response.ok || !result.success) throw new Error(result.error || 'Cancellation failed');
+                } catch (error) { alert(error.message); return; }
             }
             csvEnhanceProcessedData = [];
             csvEnhanceFailures = [];
             csvEnhanceFailedCount = 0;
             csvEnhanceJobId = null;
+            if (csvEnhancePollTimer) clearTimeout(csvEnhancePollTimer);
             try { localStorage.removeItem('listingCannonBulkSeoJobId'); } catch (e) {}
             document.getElementById('csv-enhance-results-section').style.display = 'none';
             document.getElementById('csv-enhance-download-section').style.display = 'none';
@@ -14697,15 +14646,15 @@
                 variant_inventory_location_id: defaultLocationId,
                 variant_inventory_location_name: getInventoryLocationName(defaultLocationId),
                 variant_apply_inventory: 'false',
-                variant_sku: product.variant_sku || '',
-                variant_barcode: product.variant_barcode || '',
-                variant_price: product.variant_price || '',
-                variant_compare_at_price: product.variant_compare_at_price || '',
-                variant_inventory_quantity: product.variant_inventory_quantity || '',
-                variant_inventory_policy: product.variant_inventory_policy || '',
-                variant_taxable: product.variant_taxable || '',
-                variant_weight: product.variant_weight || '',
-                variant_weight_unit: product.variant_weight_unit || '',
+                variant_sku: product.variant_sku ?? '',
+                variant_barcode: product.variant_barcode ?? '',
+                variant_price: product.variant_price ?? '',
+                variant_compare_at_price: product.variant_compare_at_price ?? '',
+                variant_inventory_quantity: product.variant_inventory_quantity ?? '',
+                variant_inventory_policy: product.variant_inventory_policy ?? '',
+                variant_taxable: product.variant_taxable ?? '',
+                variant_weight: product.variant_weight ?? '',
+                variant_weight_unit: product.variant_weight_unit ?? '',
                 variant_mode: 'merge',
                 original_variant_ids: variants.map(function(variant) { return variant.id; }).filter(Boolean),
                 metafield_color: product.metafield_color || '',
@@ -14730,6 +14679,10 @@
         }
 
         function startManualBulkEdit() {
+            bulkResultPage = 1;
+            csvEnhanceJobId = null;
+            if (csvEnhancePollTimer) clearTimeout(csvEnhancePollTimer);
+            try { localStorage.removeItem('listingCannonBulkSeoJobId'); } catch (e) {}
             const selectedProducts = getSelectedBulkProducts();
             if (selectedProducts.length === 0) {
                 alert('Please select at least one product to edit.');
@@ -14783,6 +14736,7 @@
         }
 
         function startServerCsvEnhanceJob(selectedProducts) {
+            bulkResultPage = 1;
             const progressBar = document.getElementById('csv-enhance-progress-bar');
             const progressText = document.getElementById('csv-enhance-progress-text');
             const progressLog = document.getElementById('csv-enhance-progress-log');
@@ -14835,21 +14789,45 @@
         function pollCsvEnhanceJob() {
             if (!csvEnhanceJobId) return;
             if (csvEnhancePollTimer) clearTimeout(csvEnhancePollTimer);
-
-            fetch('/api/bulk_seo_jobs/' + encodeURIComponent(csvEnhanceJobId), { credentials: 'same-origin' })
+            const polledJobId = csvEnhanceJobId;
+            const url = '/api/bulk_seo_jobs/' + encodeURIComponent(polledJobId);
+            fetch(url + '?summary=1', { credentials: 'same-origin' })
                 .then(response => response.json())
                 .then(data => {
+                    if (polledJobId !== csvEnhanceJobId) return;
                     if (!data.success) throw new Error(data.error || 'Failed to read job');
-                    updateCsvEnhanceFromJob(data.job);
                     if (['processing', 'queued', 'applying'].includes(data.job.status)) {
+                        updateBulkJobSummary(data.job);
                         csvEnhancePollTimer = setTimeout(pollCsvEnhanceJob, 2500);
+                        return;
                     }
+                    // Download proposals once when ready, not on every progress tick.
+                    return fetch(url, { credentials: 'same-origin' }).then(response => response.json()).then(full => {
+                        if (polledJobId !== csvEnhanceJobId) return;
+                        if (!full.success) throw new Error(full.error || 'Failed to read results');
+                        updateCsvEnhanceFromJob(full.job);
+                    });
                 })
                 .catch(error => {
-                    const progressLog = document.getElementById('csv-enhance-progress-log');
-                    appendCsvProgressLog(progressLog, '<div><span class="text-warning">[' + new Date().toLocaleTimeString() + ']</span> Poll failed: ' + csvEnhanceEsc(error.message || error) + '</div>');
+                    if (polledJobId !== csvEnhanceJobId) return;
+                    const log = document.getElementById('csv-enhance-progress-log');
+                    appendCsvProgressLog(log, '<div class="text-warning">' + csvEnhanceEsc(error.message || error) + '</div>');
                     csvEnhancePollTimer = setTimeout(pollCsvEnhanceJob, 5000);
                 });
+        }
+
+        function updateBulkJobSummary(job) {
+            const applying = job.status === 'applying';
+            const total = applying ? job.enhancement_count : job.product_count;
+            const done = applying ? (job.apply_index || 0) : (job.current_index || 0);
+            const bar = document.getElementById('csv-enhance-progress-bar');
+            if (bar) bar.style.width = (total ? Math.min(100, Math.round(done / total * 100)) : 0) + '%';
+            const text = document.getElementById('csv-enhance-progress-text');
+            if (text) text.textContent = (applying ? 'Applying ' : 'Enhancing ') + done + '/' + total;
+            const step = document.getElementById('csv-enhance-time-remaining');
+            if (step) step.textContent = job.current_step || '';
+            const log = document.getElementById('csv-enhance-progress-log');
+            if (log) log.innerHTML = (job.logs || []).map(entry => '<div>' + csvEnhanceEsc(entry.message || '') + '</div>').join('');
         }
 
         function updateCsvEnhanceFromJob(job) {
@@ -14895,7 +14873,7 @@
 
             if (job.status === 'enhanced') {
                 onCsvEnhanceComplete(products.length);
-            } else if (job.status === 'applied') {
+            } else if (job.status === 'applied' || job.status === 'applied_with_errors') {
                 resetBulkEnhancementUi();
                 progressBar.style.width = '100%';
                 progressBar.classList.remove('progress-bar-animated');
@@ -14904,11 +14882,26 @@
                 const results = job.apply_results || [];
                 const success = results.filter(r => r.success).length;
                 const failed = results.length - success;
-                if (applyStatus) applyStatus.innerHTML = '<span class="text-success">Applied ' + success + ' products to Shopify' + (failed ? ' (' + failed + ' failed).' : '.') + '</span>';
-            } else if (job.status === 'error' || job.status === 'paused') {
+                if (applyStatus) applyStatus.innerHTML = '<span class="' + (failed ? 'text-warning' : 'text-success') + '">Applied ' + success + ' products to Shopify' + (failed ? ' (' + failed + ' failed).' : '.') + '</span>';
+            } else if (['error', 'paused', 'cancelled'].includes(job.status)) {
                 resetBulkEnhancementUi();
                 progressBar.classList.remove('progress-bar-animated');
-                progressText.textContent = job.status === 'paused' ? 'Paused' : 'Error';
+                progressText.textContent = job.status === 'paused' ? 'Paused' : (job.status === 'cancelled' ? 'Cancelled' : 'Error');
+                if (job.status !== 'cancelled' && !job.in_flight) {
+                    const resume = document.createElement('button');
+                    resume.className = 'btn btn-sm btn-outline-primary ms-2';
+                    resume.textContent = 'Resume';
+                    resume.onclick = async () => {
+                        resume.disabled = true;
+                        try {
+                            const response = await fetch('/api/bulk_seo_jobs/' + csvEnhanceJobId + '/resume', {method: 'POST'});
+                            const result = await response.json();
+                            if (!response.ok || !result.success) throw new Error(result.error || 'Resume failed');
+                            pollCsvEnhanceJob();
+                        } catch (error) { alert(error.message); resume.disabled = false; }
+                    };
+                    progressText.appendChild(resume);
+                }
                 const downloadAlert = document.querySelector('#csv-enhance-download-section .alert-success');
                 if (downloadAlert) downloadAlert.innerHTML = '<i class="fas fa-exclamation-triangle me-2"></i>' + csvEnhanceEsc(job.current_step || 'Job stopped.');
                 document.getElementById('csv-enhance-download-section').style.display = enhancements.length ? 'block' : 'none';
@@ -14930,6 +14923,19 @@
             return original[field.key] == null ? '' : original[field.key];
         }
 
+        function changeBulkResultPage(delta) {
+            bulkResultPage += delta;
+            renderCsvEnhanceResults();
+        }
+
+        function getBulkResultPageEntries() {
+            const pages = Math.max(1, Math.ceil(csvEnhanceProcessedData.length / BULK_RESULT_PAGE_SIZE));
+            bulkResultPage = Math.max(1, Math.min(pages, bulkResultPage));
+            const start = (bulkResultPage - 1) * BULK_RESULT_PAGE_SIZE;
+            return csvEnhanceProcessedData.slice(start, start + BULK_RESULT_PAGE_SIZE)
+                .map((item, offset) => ({ item, index: start + offset }));
+        }
+
         function renderCsvEnhanceResults() {
             const section = document.getElementById('csv-enhance-results-section');
             const head = document.getElementById('csv-enhance-results-head');
@@ -14948,7 +14954,20 @@
                     '<th class="' + (field.type === 'textarea' ? 'bulk-col-long' : 'bulk-col-medium') + '">' + csvEnhanceEsc(field.label) + '</th>'
                 )).join('') + '</tr>';
             }
-            body.innerHTML = csvEnhanceProcessedData.map(function(item, index) {
+            const pageEntries = getBulkResultPageEntries();
+            let pager = document.getElementById('bulk-result-pager');
+            if (!pager) {
+                pager = document.createElement('div');
+                pager.id = 'bulk-result-pager';
+                pager.className = 'd-flex align-items-center gap-3 mb-2';
+                section.prepend(pager);
+            }
+            const pages = Math.max(1, Math.ceil(csvEnhanceProcessedData.length / BULK_RESULT_PAGE_SIZE));
+            pager.innerHTML = '<button type="button" class="btn btn-sm btn-outline-secondary" onclick="changeBulkResultPage(-1)" ' + (bulkResultPage <= 1 ? 'disabled' : '') + '>Previous</button>' +
+                '<span>Page ' + bulkResultPage + ' of ' + pages + ' | ' + csvEnhanceProcessedData.length + ' proposals</span>' +
+                '<button type="button" class="btn btn-sm btn-outline-secondary" onclick="changeBulkResultPage(1)" ' + (bulkResultPage >= pages ? 'disabled' : '') + '>Next</button>';
+            body.innerHTML = pageEntries.map(function(entry) {
+                const {item, index} = entry;
                 const enhanced = item.enhanced || {};
                 const originalRow = getBulkProductByOriginalIndex(item.originalIndex);
                 return '<tr>' + editableFields.map(function(field) {
@@ -14960,7 +14979,7 @@
                     const beforeHtml = '<div class="small text-muted mb-1" title="' + csvEnhanceEsc(beforeValue) +
                         '"><strong>Current:</strong> ' + csvEnhanceEsc(String(beforeValue).slice(0, 120) || '?') + '</div>';
                     if (field.typeKey && !enhanced[field.typeKey]) enhanced[field.typeKey] = field.metafieldType || 'single_line_text_field';
-                    const rawValue = field.sourceHeader ? ((enhanced.source_columns || {})[field.sourceHeader] || '') : (enhanced[field.key] || '');
+                    const rawValue = field.sourceHeader ? ((enhanced.source_columns || {})[field.sourceHeader] || '') : (enhanced[field.key] ?? '');
                     const value = csvEnhanceEsc(rawValue);
                     if (field.type === 'textarea') {
                         const button = field.isProductReference ? '<button type="button" class="btn btn-sm btn-outline-secondary mt-1" onclick="pickProductReference(' + index + ', \'' + field.key + '\')"><i class="fas fa-search me-1"></i>Find product</button>' : '';
@@ -15011,6 +15030,7 @@
         function updateEnhancedField(index, field, value) {
             if (!csvEnhanceProcessedData[index]) return;
             if (!csvEnhanceProcessedData[index].enhanced) csvEnhanceProcessedData[index].enhanced = {};
+            csvEnhanceProcessedData[index].enhanced._no_change = false;
             if (field.startsWith('source_columns.')) {
                 const sourceHeader = field.slice('source_columns.'.length);
                 if (!csvEnhanceProcessedData[index].enhanced.source_columns) csvEnhanceProcessedData[index].enhanced.source_columns = {};
@@ -15264,6 +15284,7 @@
             })
             .then(response => {
                 clearTimeout(timeoutId);
+                if (!response.ok) return response.json().then(data => { throw new Error(data.error || 'CSV export failed'); });
                 return response.blob();
             })
             .then(blob => {
@@ -15283,7 +15304,7 @@
                 if (error.name === 'AbortError') {
                     alert('Download is taking longer than usual. The server may still be building your file. Please try again in a moment.');
                 } else {
-                    alert('Failed to download enhanced CSV.');
+                    alert(error.message || 'Failed to download enhanced CSV.');
                 }
             });
         }
@@ -15389,6 +15410,15 @@
             })
             .then(response => response.json())
             .then(data => {
+                if (data.success && data.job_id) {
+                    csvEnhanceJobId = data.job_id;
+                    try { localStorage.setItem('listingCannonBulkSeoJobId', csvEnhanceJobId); } catch (e) {}
+                    document.getElementById('csv-enhance-progress-section').style.display = 'block';
+                    if (statusEl) statusEl.textContent = 'Shopify apply job started...';
+                    pollCsvEnhanceJob();
+                    return;
+                }
+                if (!data.success && !Array.isArray(data.results)) throw new Error(data.error || 'Shopify update failed');
                 if (statusEl) {
                     const failed = data.failed_count || 0;
                     const success = data.success_count || 0;

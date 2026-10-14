@@ -1,3 +1,7 @@
+import functools
+import math
+import random
+from bulk_edit_patch import rows as edit_rows
 import os
 import re
 import requests
@@ -681,6 +685,23 @@ def execute_graphql_query(query, variables=None, shop_domain=None, access_token=
             return None
 
         result = response.json()
+
+        for attempt in range(3):
+            errors = result.get('errors') or []
+            if not errors or result.get('data') or not all((e.get('extensions') or {}).get('code') == 'THROTTLED' for e in errors):
+                break
+            cost = (result.get('extensions') or {}).get('cost') or {}
+            throttle = cost.get('throttleStatus') or {}
+            deficit = max(0, (cost.get('requestedQueryCost') or 0) - (throttle.get('currentlyAvailable') or 0))
+            rate = throttle.get('restoreRate') or 1
+            delay = min(60, max(2 ** attempt, deficit / rate)) + random.uniform(0, 0.25)
+            time.sleep(delay)
+            response = _retry_with_backoff(lambda: requests.post(url, headers=headers, json=payload, timeout=30), max_retries=3, context='GraphQL throttle retry')
+            if response is None or response.status_code != 200:
+                if raise_errors:
+                    raise RuntimeError('Shopify throttle retry failed')
+                return None
+            result = response.json()
 
         # Check for GraphQL-level errors (different from userErrors)
         if 'errors' in result:
@@ -1444,7 +1465,7 @@ def list_products_for_seo_enhancement(
         }
         result = execute_graphql_query(query, variables, shop_domain=shop_domain, access_token=access_token)
         if not result or not result.get("data"):
-            break
+            raise RuntimeError("Shopify catalogue read failed; scan is incomplete")
 
         products_data = result["data"].get("products") or {}
         for edge in products_data.get("edges", []):
@@ -2523,6 +2544,8 @@ def _json_payload_error(value, label, expected_type=list):
             return f"{label} contains invalid JSON: {exc.msg}"
         if not isinstance(parsed, expected_type):
             return f"{label} must be a JSON {expected_type.__name__}"
+    elif value not in (None, ""):
+        return f"{label} must be a JSON {expected_type.__name__}"
     return ""
 
 
@@ -2537,6 +2560,131 @@ def _normalize_shopify_weight_unit(value):
     return aliases.get(normalized)
 
 
+def _edit_result(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (ValueError, RuntimeError) as exc:
+            return {"success": False, "error": str(exc)}
+    return wrapped
+
+
+def _execute_checked_edit_mutation(query, variables, **credentials):
+    """Validate every response and respect mutation-specific input limits."""
+    specs = {
+        'productUpdate': (None, 250, 'product'),
+        'metafieldsSet': ('metafields', 25, 'metafields'),
+        'metafieldsDelete': ('metafields', 25, 'deletedMetafields'),
+        'inventorySetQuantities': (None, 250, 'inventoryAdjustmentGroup'),
+        'productUpdateMedia': ('media', 250, 'media'),
+        'productVariantAppendMedia': ('variantMedia', 250, 'productVariants'),
+        'priceListFixedPricesAdd': ('prices', 250, 'prices'),
+        'productVariantsBulkUpdate': ('variants', 250, 'productVariants'),
+        'productVariantsBulkCreate': ('variants', 250, 'productVariants'),
+        'productVariantsBulkDelete': ('variantIds', 250, 'product'),
+    }
+    field = next((key for key in specs if re.search(r'\b' + key + r'\s*\(', query)), None)
+    if field is None:
+        raise ValueError('Unsupported bulk edit mutation')
+    array_key, limit, result_key = specs[field]
+    values = variables.get(array_key, []) if array_key else []
+    chunks = [values[i:i + limit] for i in range(0, len(values), limit)] if values else [None]
+    merged = None
+    for number, chunk in enumerate(chunks, 1):
+        payload = dict(variables)
+        if chunk is not None:
+            payload[array_key] = chunk
+        result = execute_graphql_query(query, payload, **credentials)
+        data = (result or {}).get('data') or {}
+        mutation = data.get(field)
+        prefix = f'{field} batch {number}/{len(chunks)}'
+        if not result or result.get('errors') or not isinstance(mutation, dict):
+            raise RuntimeError(prefix + ': Shopify did not confirm the write; refresh before retrying')
+        errors = mutation.get('userErrors') or mutation.get('mediaUserErrors') or []
+        if errors:
+            raise RuntimeError(prefix + ': ' + '; '.join(e.get('message', 'Unknown error') for e in errors))
+        if mutation.get(result_key) is None:
+            raise RuntimeError(prefix + ': Shopify returned no mutation result')
+        confirmed = mutation[result_key]
+        if result_key == 'product' and (not isinstance(confirmed, dict) or not confirmed.get('id')):
+            raise RuntimeError(prefix + ': Shopify returned no product ID')
+        if array_key and result_key != 'product' and (not isinstance(confirmed, list) or len(confirmed) != len(payload[array_key])):
+            raise RuntimeError(prefix + ': Shopify did not confirm every requested item')
+        if merged is None:
+            merged = {field: dict(mutation)}
+        elif isinstance(mutation[result_key], list):
+            merged[field][result_key] = merged[field][result_key] + mutation[result_key]
+    return {'data': merged}
+
+
+def _collection_membership_patch(product_id, names, shop_domain=None, access_token=None):
+    desired_names = names if isinstance(names, list) else str(names or '').split(',')
+    desired_names = [name.strip() for name in desired_names if name.strip()]
+    directory = _load_collection_directory(shop_domain, access_token) or {}
+    mapping = directory.get('ids') or {}
+    missing = [name for name in desired_names if name not in mapping]
+    if missing:
+        raise ValueError('Unknown collection names: ' + ', '.join(missing))
+    desired = {mapping[name] for name in desired_names}
+    current = set()
+    smart = set(directory.get('smart_ids') or [])
+    cursor = None
+    while True:
+        result = execute_graphql_query("""
+        query bulkEditMemberships($id: ID!, $after: String) {
+          product(id: $id) { collections(first: 250, after: $after) {
+            nodes { id ruleSet { appliedDisjunctively } }
+            pageInfo { hasNextPage endCursor }
+          } }
+        }
+        """, {'id': product_id, 'after': cursor}, shop_domain=shop_domain, access_token=access_token, raise_errors=True)
+        connection = (((result or {}).get('data') or {}).get('product') or {}).get('collections')
+        if not isinstance(connection, dict):
+            raise RuntimeError('Could not read current collection membership')
+        for collection in connection.get('nodes') or []:
+            current.add(collection['id'])
+            if collection.get('ruleSet') is not None:
+                smart.add(collection['id'])
+        page = connection.get('pageInfo') or {}
+        if not page.get('hasNextPage'):
+            break
+        next_cursor = page.get('endCursor')
+        if not next_cursor or next_cursor == cursor:
+            raise RuntimeError('Collection pagination did not advance')
+        cursor = next_cursor
+    if (desired ^ current) & smart:
+        raise ValueError('Smart collection membership is controlled by rules; use the tag/collection tools to change it')
+    added, removed = sorted(desired - current), sorted(current - desired)
+    if max(len(added), len(removed)) > 250:
+        raise ValueError('Change at most 250 collection memberships per product at a time')
+    return {'collectionsToJoin': added, 'collectionsToLeave': removed}
+
+
+def _variant_create_input_from_edit(variant):
+    # Reuse the update mapper to retain exact SKU, barcode, tax, price and weight.
+    value = _variant_update_input_from_data(dict(variant, id='new')) or {}
+    value.pop('id', None)
+    options = []
+    for index in range(1, 4):
+        name = variant.get(f'option{index}_name')
+        option_value = variant.get(f'option{index}_value')
+        if name and option_value not in (None, ''):
+            options.append({'optionName': str(name), 'name': str(option_value)})
+        elif name or option_value not in (None, ''):
+            raise ValueError('New variants require both an option name and value')
+    if not options:
+        raise ValueError('New variants require explicit option names and values')
+    value['optionValues'] = options
+    if 'inventory_quantity' in variant and variant['inventory_quantity'] not in (None, ''):
+        location = variant.get('inventory_location_id')
+        quantity = float(str(variant['inventory_quantity']))
+        if not location or not math.isfinite(quantity) or not quantity.is_integer():
+            raise ValueError('New variant inventory requires a location and whole-number quantity')
+        value['inventoryQuantities'] = [{'locationId': location, 'availableQuantity': int(quantity)}]
+    return value
+
+
 def _variant_update_input_from_data(data):
     variant_id = data.get("id") or data.get("variant_id")
     if not variant_id:
@@ -2546,18 +2694,18 @@ def _variant_update_input_from_data(data):
     if data.get("price") not in (None, ""):
         variant_input["price"] = str(data["price"])
     compare_price = data.get("compare_at_price", data.get("compareAtPrice"))
-    if compare_price not in (None, ""):
-        variant_input["compareAtPrice"] = str(compare_price)
-    if data.get("barcode") not in (None, ""):
-        variant_input["barcode"] = str(data["barcode"])
+    if "compare_at_price" in data or "compareAtPrice" in data:
+        variant_input["compareAtPrice"] = None if compare_price in (None, "") else str(compare_price)
+    if "barcode" in data:
+        variant_input["barcode"] = str(data["barcode"] or "")
     inventory_policy = data.get("inventory_policy", data.get("inventoryPolicy"))
     if inventory_policy not in (None, ""):
         variant_input["inventoryPolicy"] = str(inventory_policy).upper()
     if data.get("taxable") not in (None, ""):
         variant_input["taxable"] = str(data["taxable"]).strip().lower() in ("1", "true", "yes", "y", "on")
     inventory_item = {}
-    if data.get("sku") not in (None, ""):
-        inventory_item["sku"] = str(data["sku"])
+    if "sku" in data:
+        inventory_item["sku"] = str(data["sku"] or "")
 
     raw_weight = data.get("weight")
     raw_weight_unit = data.get("weight_unit", data.get("weightUnit"))
@@ -2567,7 +2715,7 @@ def _variant_update_input_from_data(data):
             weight = float(raw_weight)
         except (TypeError, ValueError):
             raise ValueError("Variant weight must be a number when a weight unit is supplied")
-        if weight < 0:
+        if not math.isfinite(weight) or weight < 0:
             raise ValueError("Variant weight cannot be negative")
         if not unit:
             raise ValueError("Weight unit must be grams, kilograms, ounces, or pounds")
@@ -2579,9 +2727,13 @@ def _variant_update_input_from_data(data):
     return variant_input if len(variant_input) > 1 else None
 
 
+@_edit_result
 def _set_inventory_quantity(inventory_item_id, location_id, quantity, shop_domain=None, access_token=None):
     try:
-        quantity = int(float(str(quantity).strip()))
+        numeric_quantity = float(str(quantity).strip())
+        if not math.isfinite(numeric_quantity) or not numeric_quantity.is_integer():
+            raise ValueError("Inventory quantity must be a whole number")
+        quantity = int(numeric_quantity)
     except (TypeError, ValueError):
         return {"success": False, "error": "Inventory quantity must be a number"}
 
@@ -2613,13 +2765,14 @@ def _set_inventory_quantity(inventory_item_id, location_id, quantity, shop_domai
             }],
         }
     }
-    result = execute_graphql_query(mutation, variables, shop_domain=shop_domain, access_token=access_token)
+    result = _execute_checked_edit_mutation(mutation, variables, shop_domain=shop_domain, access_token=access_token)
     errors = ((result or {}).get("data") or {}).get("inventorySetQuantities", {}).get("userErrors") or []
     if errors:
         return {"success": False, "error": "; ".join(e.get("message", "Unknown error") for e in errors)}
     return {"success": True}
 
 
+@_edit_result
 def _update_product_media_alt(product_id, media_updates, shop_domain=None, access_token=None):
     media_input = []
     for item in media_updates or []:
@@ -2647,7 +2800,7 @@ def _update_product_media_alt(product_id, media_updates, shop_domain=None, acces
       }
     }
     """
-    result = execute_graphql_query(
+    result = _execute_checked_edit_mutation(
         mutation,
         {"productId": product_id, "media": media_input},
         shop_domain=shop_domain,
@@ -2659,6 +2812,7 @@ def _update_product_media_alt(product_id, media_updates, shop_domain=None, acces
     return {"success": True, "updated": len(media_input)}
 
 
+@_edit_result
 def assign_media_to_product_variants(product_id, media_id, variant_ids, shop_domain=None, access_token=None):
     """Attach an existing product media item to selected product variants."""
     if not product_id:
@@ -2695,7 +2849,7 @@ def assign_media_to_product_variants(product_id, media_id, variant_ids, shop_dom
       }
     }
     """
-    result = execute_graphql_query(
+    result = _execute_checked_edit_mutation(
         mutation,
         {"productId": product_id, "variantMedia": variant_media},
         shop_domain=shop_domain,
@@ -2711,6 +2865,7 @@ def assign_media_to_product_variants(product_id, media_id, variant_ids, shop_dom
     }
 
 
+@_edit_result
 def _update_price_list_prices(price_list_updates, shop_domain=None, access_token=None):
     updated = 0
     for group in price_list_updates or []:
@@ -2757,7 +2912,7 @@ def _update_price_list_prices(price_list_updates, shop_domain=None, access_token
           }
         }
         """
-        result = execute_graphql_query(
+        result = _execute_checked_edit_mutation(
             mutation,
             {"priceListId": price_list_id, "prices": prices},
             shop_domain=shop_domain,
@@ -2771,14 +2926,71 @@ def _update_price_list_prices(price_list_updates, shop_domain=None, access_token
     return {"success": True, "updated": updated}
 
 
+@_edit_result
 def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, access_token=None):
     """Apply AI-enhanced product fields and metafields to an existing Shopify product."""
     if not product_id:
         return {"success": False, "error": "Missing Shopify product id"}
 
+    if enhanced_data.get('_only_fields'):
+        scope = set(enhanced_data['_only_fields'])
+        if 'product_category' in scope:
+            scope.add('category_gid')
+        enhanced_data = {key: value for key, value in enhanced_data.items()
+                         if key in scope or key == 'product_id' or
+                         (key.startswith('mf_type__') and key.replace('mf_type__', 'mf__', 1) in scope)}
+    variants = edit_rows(enhanced_data.get('variants_json'), 'Variants')
+    edit_rows(enhanced_data.get('media_json'), 'Media')
+    edit_rows(enhanced_data.get('price_lists_json'), 'Market prices')
+    mode = enhanced_data.get('variant_mode', 'merge')
+    if mode not in ('merge', 'append', 'replace'):
+        raise ValueError('Variant mode must be merge, append, or replace')
+    if mode == 'replace' and not variants:
+        raise ValueError('Variant replacement requires at least one proposed variant')
+    create_inputs = []
+    for variant in variants:
+        if not (variant.get('id') or variant.get('variant_id')):
+            create_inputs.append(_variant_create_input_from_edit(variant))
+            continue
+        _variant_update_input_from_data(variant)
+        if str(variant.get('apply_inventory', '')).lower() in ('true', '1', 'yes', 'on'):
+            if not variant.get('inventory_item_id') or not variant.get('inventory_location_id'):
+                raise ValueError('Inventory edits require an inventory item and location')
+            quantity = float(str(variant.get('inventory_quantity', '')))
+            if not math.isfinite(quantity) or not quantity.is_integer():
+                raise ValueError('Inventory quantity must be a whole number')
+    for key in ('title', 'handle'):
+        if key in enhanced_data and not str(enhanced_data[key] or '').strip():
+            raise ValueError(key + ' cannot be blank')
+
+    removed_standalone_id = None
+    if create_inputs:
+        current = execute_graphql_query("""
+        query bulkVariantOptions($id: ID!) {
+          product(id: $id) { hasOnlyDefaultVariant options { name }
+            variants(first: 1) { nodes { id } }
+          }
+        }
+        """, {'id': product_id}, shop_domain=shop_domain, access_token=access_token, raise_errors=True)
+        current = ((current or {}).get('data') or {}).get('product')
+        if not current:
+            raise RuntimeError('Could not verify product options before creating variants')
+        names = {option['name'] for option in current.get('options') or []}
+        if any(option['optionName'] not in names for item in create_inputs for option in item['optionValues']):
+            raise ValueError('Add the new option names in Shopify before creating variants for those options')
+        if current.get('hasOnlyDefaultVariant'):
+            if mode != 'replace':
+                raise ValueError('Replacing the default variant requires replace mode and variant replacement confirmation')
+            existing = (current.get('variants') or {}).get('nodes') or []
+            removed_standalone_id = existing[0]['id'] if existing else None
+            if any(v.get('id') == removed_standalone_id for v in variants if v.get('id')):
+                raise ValueError('Remove the default variant from the replacement proposal before creating its replacements')
+
     product_input = {
         "id": product_id,
     }
+    if 'collections' in enhanced_data:
+        product_input.update(_collection_membership_patch(product_id, enhanced_data['collections'], shop_domain, access_token))
     if enhanced_data.get("handle"):
         product_input["handle"] = str(enhanced_data["handle"]).strip()
     if enhanced_data.get("status"):
@@ -2786,24 +2998,24 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
 
     if enhanced_data.get("title"):
         product_input["title"] = enhanced_data["title"]
-    if enhanced_data.get("body_html"):
+    if "body_html" in enhanced_data:
         product_input["descriptionHtml"] = enhanced_data["body_html"]
-    if enhanced_data.get("tags"):
+    if "tags" in enhanced_data:
         if isinstance(enhanced_data["tags"], list):
             product_input["tags"] = enhanced_data["tags"]
         else:
-            product_input["tags"] = [t.strip() for t in str(enhanced_data["tags"]).split(",") if t.strip()]
-    if enhanced_data.get("vendor"):
+            product_input["tags"] = [t.strip() for t in str(enhanced_data["tags"] or "").split(",") if t.strip()]
+    if "vendor" in enhanced_data:
         product_input["vendor"] = enhanced_data["vendor"]
-    if enhanced_data.get("product_type"):
+    if "product_type" in enhanced_data:
         product_input["productType"] = enhanced_data["product_type"]
-    if enhanced_data.get("category_gid"):
-        product_input["category"] = enhanced_data["category_gid"]
-    if enhanced_data.get("seo_title") or enhanced_data.get("seo_description"):
+    if "category_gid" in enhanced_data:
+        product_input["category"] = enhanced_data["category_gid"] or None
+    if "seo_title" in enhanced_data or "seo_description" in enhanced_data:
         product_input["seo"] = {}
-        if enhanced_data.get("seo_title"):
+        if "seo_title" in enhanced_data:
             product_input["seo"]["title"] = enhanced_data["seo_title"]
-        if enhanced_data.get("seo_description"):
+        if "seo_description" in enhanced_data:
             product_input["seo"]["description"] = enhanced_data["seo_description"]
 
     mutation = """
@@ -2821,7 +3033,8 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
       }
     }
     """
-    result = execute_graphql_query(mutation, {"product": product_input}, shop_domain=shop_domain, access_token=access_token)
+    result = (_execute_checked_edit_mutation(mutation, {"product": product_input}, shop_domain=shop_domain, access_token=access_token)
+              if len(product_input) > 1 else {'data': {'productUpdate': {'product': {'id': product_id}}}})
     if not result or not result.get("data"):
         return {"success": False, "error": "Shopify productUpdate failed"}
 
@@ -2831,6 +3044,7 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
         return {"success": False, "error": "; ".join(e.get("message", "Unknown error") for e in errors)}
 
     metafields = []
+    metafields_to_delete = {}
     metafield_key_map = {
         "metafield_color": ("custom", "color"),
         "metafield_theme": ("custom", "theme"),
@@ -2850,8 +3064,11 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
         "custom_label_4": ("mm-google-shopping", "custom_label_4"),
     }
     for data_key, (namespace, key) in metafield_key_map.items():
-        value = enhanced_data.get(data_key)
+        if data_key not in enhanced_data:
+            continue
+        value = enhanced_data[data_key]
         if value is None or str(value).strip() == "":
+            metafields_to_delete[(namespace, key)] = {'ownerId': product_id, 'namespace': namespace, 'key': key}
             continue
         metafield_type = "single_line_text_field"
         metafield_value = str(value)
@@ -2886,12 +3103,13 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
     for data_key, value in enhanced_data.items():
         if not data_key.startswith("mf__") or data_key.startswith("mf_type__"):
             continue
-        if value is None or str(value).strip() == "":
-            continue
         parts = data_key.split("__", 2)
         if len(parts) != 3:
             continue
         _, namespace, key = parts
+        if value is None or str(value).strip() == "":
+            metafields_to_delete[(namespace, key)] = {'ownerId': product_id, 'namespace': namespace, 'key': key}
+            continue
         metafield_type = enhanced_data.get(f"mf_type__{namespace}__{key}") or "single_line_text_field"
         metafields.append({
             "ownerId": product_id,
@@ -2900,6 +3118,18 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
             "type": metafield_type,
             "value": str(value),
         })
+
+    if metafields_to_delete:
+        # The explicit generic editor value wins over an alias for the same field.
+        metafields = [mf for mf in metafields if (mf['namespace'], mf['key']) not in metafields_to_delete]
+        _execute_checked_edit_mutation("""
+        mutation clearBulkEditorMetafields($metafields: [MetafieldIdentifierInput!]!) {
+          metafieldsDelete(metafields: $metafields) {
+            deletedMetafields { ownerId namespace key }
+            userErrors { field message }
+          }
+        }
+        """, {'metafields': list(metafields_to_delete.values())}, shop_domain=shop_domain, access_token=access_token)
 
     if metafields:
         deduped = {}
@@ -2921,7 +3151,7 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
           }
         }
         """
-        mf_result = execute_graphql_query(mf_mutation, {"metafields": metafields}, shop_domain=shop_domain, access_token=access_token)
+        mf_result = _execute_checked_edit_mutation(mf_mutation, {"metafields": metafields}, shop_domain=shop_domain, access_token=access_token)
         mf_errors = ((mf_result or {}).get("data") or {}).get("metafieldsSet", {}).get("userErrors") or []
         if mf_errors:
             return {
@@ -2956,16 +3186,14 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
                 variant_creates.append(variant)
     elif enhanced_data.get("variant_id"):
         try:
+            flat_fields = {
+                'variant_sku': 'sku', 'variant_barcode': 'barcode', 'variant_price': 'price',
+                'variant_compare_at_price': 'compare_at_price', 'variant_inventory_policy': 'inventory_policy',
+                'variant_taxable': 'taxable', 'variant_weight': 'weight', 'variant_weight_unit': 'weight_unit',
+            }
             variant_input = _variant_update_input_from_data({
-                "id": enhanced_data.get("variant_id"),
-                "sku": enhanced_data.get("variant_sku"),
-                "barcode": enhanced_data.get("variant_barcode"),
-                "price": enhanced_data.get("variant_price"),
-                "compare_at_price": enhanced_data.get("variant_compare_at_price"),
-                "inventory_policy": enhanced_data.get("variant_inventory_policy"),
-                "taxable": enhanced_data.get("variant_taxable"),
-                "weight": enhanced_data.get("variant_weight"),
-                "weight_unit": enhanced_data.get("variant_weight_unit"),
+                'id': enhanced_data['variant_id'],
+                **{target: enhanced_data[source] for source, target in flat_fields.items() if source in enhanced_data},
             })
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
@@ -2973,22 +3201,17 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
             variant_updates.append(variant_input)
 
     if variant_creates:
-        sku_seed = (
-            enhanced_data.get("variant_sku")
-            or enhanced_data.get("handle")
-            or enhanced_data.get("title")
-            or "POSTER"
-        )
-        create_ok = create_variants_graphql(
-            product_id,
-            variant_creates,
-            shop_domain=shop_domain,
-            access_token=access_token,
-            sku_base=str(sku_seed).upper().replace("-", "")[:24],
-        )
-        if not create_ok:
-            return {"success": False, "error": "Product updated, but variant creation failed"}
-        variants_created = len(variant_creates)
+        created = _execute_checked_edit_mutation("""
+        mutation createReviewedVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy!) {
+          productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) {
+            productVariants { id }
+            userErrors { field message }
+          }
+        }
+        """, {'productId': product_id, 'variants': create_inputs,
+                'strategy': 'REMOVE_STANDALONE_VARIANT' if removed_standalone_id else 'DEFAULT'},
+            shop_domain=shop_domain, access_token=access_token)
+        variants_created = len(created['data']['productVariantsBulkCreate']['productVariants'])
 
     if variant_updates:
             variant_mutation = """
@@ -3004,7 +3227,7 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
               }
             }
             """
-            variant_result = execute_graphql_query(
+            variant_result = _execute_checked_edit_mutation(
                 variant_mutation,
                 {"productId": product_id, "variants": variant_updates},
                 shop_domain=shop_domain,
@@ -3034,7 +3257,7 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
             for variant in (variants_payload or [])
             if variant.get("id") or variant.get("variant_id")
         }
-        delete_ids = [variant_id for variant_id in original_ids if variant_id and variant_id not in retained_ids]
+        delete_ids = [variant_id for variant_id in original_ids if variant_id and variant_id not in retained_ids and variant_id != removed_standalone_id]
         if not variants_payload:
             return {"success": False, "error": "Variant replacement requires at least one proposed variant"}
         if not retained_ids and not variants_created:
@@ -3048,7 +3271,7 @@ def update_product_seo_metadata(product_id, enhanced_data, shop_domain=None, acc
               }
             }
             """
-            delete_result = execute_graphql_query(
+            delete_result = _execute_checked_edit_mutation(
                 delete_mutation,
                 {"productId": product_id, "variantIds": delete_ids},
                 shop_domain=shop_domain,
@@ -4489,12 +4712,13 @@ def _load_collection_directory(shop_domain=None, access_token=None):
                         id
                         title
                         handle
+                        ruleSet { appliedDisjunctively }
                     }
                 }
             }
         }
         """
-        mapping = {'ids': {}, 'handles': {}}
+        mapping = {'ids': {}, 'handles': {}, 'smart_ids': []}
         cursor = None
         # Paginate: stores with more than 250 collections used to lose every
         # collection past the first page, so those assignments silently failed.
@@ -4504,12 +4728,14 @@ def _load_collection_directory(shop_domain=None, access_token=None):
                 shop_domain=shop_domain, access_token=access_token,
             )
             if not result or not result.get('data'):
-                return mapping or None
+                raise RuntimeError('Could not load the complete collection directory')
             connection = result['data'].get('collections') or {}
             for edge in connection.get('edges') or []:
                 node = edge.get('node') or {}
                 if node.get('title'):
                     mapping['ids'][node['title']] = node['id']
+                    if node.get('ruleSet') is not None:
+                        mapping['smart_ids'].append(node['id'])
                     if node.get('handle'):
                         mapping['handles'][node['title']] = node['handle']
             page_info = connection.get('pageInfo') or {}

@@ -1,3 +1,5 @@
+from bulk_csv import canonical_row, transform_csv
+from bulk_edit_patch import build_product_patch
 import os
 
 # Load .env as early as possible so SESSION_SECRET etc. are set no matter how the app is started
@@ -7386,7 +7388,7 @@ def parse_shopify_csv():
         seen_handles = set()
         
         for row_index, row in enumerate(original_rows):
-            handle = row.get('Handle', '').strip()
+            handle = canonical_row(row).get('Handle', '').strip()
             
             if not handle or handle in seen_handles:
                 continue
@@ -10321,6 +10323,7 @@ def is_safe_image_url(url):
 
 csv_enhance_jobs = {}
 csv_enhance_jobs_lock = threading.Lock()
+csv_enhance_save_lock = threading.Lock()
 
 
 def _csv_enhance_jobs_path():
@@ -10329,42 +10332,65 @@ def _csv_enhance_jobs_path():
     return os.path.join(temp_dir, 'csv_enhance_jobs.json')
 
 
-def _save_csv_enhance_jobs():
-    try:
-        path = _csv_enhance_jobs_path()
+def _save_csv_enhance_jobs(job_id):
+    import bulk_job_store as store
+    with csv_enhance_save_lock:
         with csv_enhance_jobs_lock:
-            payload = copy.deepcopy(csv_enhance_jobs)
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, default=str)
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.error(f"Failed to save CSV enhance jobs: {e}")
+            job = csv_enhance_jobs[job_id]
+            reset = job.get('_persist_reset', False)
+            counts = {} if reset else job.get('_persisted_counts', {})
+            metadata = copy.deepcopy({k: v for k, v in job.items()
+                                      if k not in store.ITEM_KINDS and not k.startswith('_')})
+            batches = {kind: [(i, copy.deepcopy(value)) for i, value in
+                              enumerate(job.get(kind, [])[counts.get(kind, 0):], start=counts.get(kind, 0))]
+                       for kind in store.ITEM_KINDS}
+            new_counts = {kind: len(job.get(kind, [])) for kind in store.ITEM_KINDS}
+        with app.app_context():
+            store.save_snapshot(job_id, metadata, batches, reset=reset)
+        with csv_enhance_jobs_lock:
+            job['_persisted_counts'] = new_counts
+            job.pop('_persist_reset', None)
 
 
 def _load_csv_enhance_jobs():
-    try:
-        path = _csv_enhance_jobs_path()
-        if not os.path.exists(path):
+    import bulk_job_store as store
+    path = _csv_enhance_jobs_path()
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as source:
+            legacy = json.load(source)
+        for job_id, job in legacy.items():
+            if db.session.get(store.BulkJobRecord, job_id) is not None:
+                continue
+            # Old checkpoints did not mark in-flight writes; treat apply as uncertain.
+            if job.get('status') == 'applying':
+                job['in_flight'] = {'legacy_checkpoint': True}
+            metadata = {k: v for k, v in job.items()
+                        if k not in store.ITEM_KINDS and not k.startswith('_')}
+            store.save_snapshot(job_id, metadata,
+                                {kind: list(enumerate(job.get(kind, []))) for kind in store.ITEM_KINDS})
+    store.pause_interrupted_jobs()
+
+
+def _ensure_csv_job_loaded(job_id):
+    import bulk_job_store as store
+    with csv_enhance_jobs_lock:
+        if job_id in csv_enhance_jobs:
             return
-        with open(path, 'r', encoding='utf-8') as f:
-            loaded = json.load(f)
-        for job in loaded.values():
-            if job.get('status') in ('processing', 'applying'):
-                job['status'] = 'paused'
-                job['current_step'] = 'Paused after server restart. Resume the job to continue.'
-            job.pop('_thread_running', None)
+    loaded = store.load_job(job_id, current_user.id)
+    if loaded is not None:
         with csv_enhance_jobs_lock:
-            csv_enhance_jobs.clear()
-            csv_enhance_jobs.update(loaded)
-        logger.info(f"Loaded {len(loaded)} CSV enhance jobs from disk")
-    except Exception as e:
-        logger.error(f"Failed to load CSV enhance jobs: {e}")
+            csv_enhance_jobs.setdefault(job_id, loaded)
 
 
-def _csv_job_public(job):
-    public_job = copy.deepcopy(job)
-    public_job.pop('_thread_running', None)
+def _csv_job_public(job, summary=False):
+    excluded = {'_thread_running'}
+    if summary:
+        excluded.update({'products', 'enhancements', 'failures', 'apply_results'})
+    public_job = copy.deepcopy({key: value for key, value in job.items() if key not in excluded and not key.startswith('_')})
+    if summary:
+        public_job.update(summary=True, product_count=len(job.get('products', [])),
+                          enhancement_count=len(job.get('enhancements', [])),
+                          failure_count=len(job.get('failures', [])))
     return public_job
 
 
@@ -10471,7 +10497,10 @@ def _resolve_enhanced_category(enhanced):
     """Resolve an edited category name to the Shopify taxonomy GID required by productUpdate."""
     category_name = (enhanced.get('product_category') or '').strip()
     if category_name:
-        enhanced['category_gid'] = resolve_category_name_to_gid(category_name) or enhanced.get('category_gid', '')
+        resolved = resolve_category_name_to_gid(category_name)
+        if not resolved:
+            raise ValueError('Unrecognized product category; choose a valid Shopify taxonomy category')
+        enhanced['category_gid'] = resolved
     return enhanced
 
 
@@ -10496,8 +10525,19 @@ def _apply_category_attribute_metafields(enhanced, shop_domain=None, access_toke
 
 def _shopify_csv_row_to_product(row, row_index):
     """Normalize a Shopify CSV product row while preserving every source column."""
+    original_row = row
+    row = canonical_row(row)
     return {
         'row_index': row_index,
+        'variant_sku': row.get('Variant SKU', ''),
+        'variant_price': row.get('Variant Price', ''),
+        'variant_barcode': row.get('Variant Barcode', ''),
+        'variant_compare_at_price': row.get('Variant Compare At Price', ''),
+        'variant_inventory_quantity': row.get('Variant Inventory Qty', ''),
+        'variant_inventory_policy': row.get('Variant Inventory Policy', ''),
+        'variant_taxable': row.get('Variant Taxable', ''),
+        'variant_weight': row.get('Variant Grams', ''),
+        'variant_weight_unit': row.get('Variant Weight Unit', ''),
         'handle': row.get('Handle', '').strip(),
         'title': row.get('Title', ''),
         'body_html': row.get('Body (HTML)', ''),
@@ -10527,7 +10567,7 @@ def _shopify_csv_row_to_product(row, row_index):
         'metafield_condition': row.get('Metafield: custom.condition [single_line_text_field]', ''),
         'metafield_decoration_material': row.get('Metafield: custom.decoration_material [single_line_text_field]', ''),
         'metafield_artwork_frame_material': row.get('Metafield: custom.artwork_frame_material [single_line_text_field]', ''),
-        'source_columns': row,
+        'source_columns': original_row,
     }
 
 
@@ -10968,7 +11008,7 @@ def _enhance_product_for_bulk_job(product, custom_prompt, field_settings, vendor
         ai_collections_str = ', '.join(str(c) for c in raw_collections) if isinstance(raw_collections, list) else str(raw_collections)
         ai_metafields = metadata.get('metafields', {})
 
-        variant_sku = ''
+        variant_sku = product.get('variant_sku', '')
         if sku_pattern:
             handle = product.get('handle', '')
             variant_sku = f"{sku_pattern}-{handle[:20].upper().replace('-', '')}" if handle else sku_pattern
@@ -10990,22 +11030,6 @@ def _enhance_product_for_bulk_job(product, custom_prompt, field_settings, vendor
             except Exception as exc:
                 logger.warning("Bulk discovery recommendation lookup failed: %s", exc)
         variants_for_apply = copy.deepcopy(product.get('variants') or [])
-        if _has_weak_single_default_variant(product):
-            variants_for_apply = _default_bulk_variant_rows(
-                product,
-                sku_pattern=sku_pattern,
-                default_location_id=product.get('variant_inventory_location_id', ''),
-            )
-        else:
-            for index, variant in enumerate(variants_for_apply):
-                if variant_sku and not variant.get('sku'):
-                    variant['sku'] = f"{variant_sku}-V{index + 1}" if len(variants_for_apply) > 1 else variant_sku
-                if variant.get('inventory_quantity') in (None, '') and product.get('variant_inventory_location_id'):
-                    variant['inventory_quantity'] = 999
-                    variant['inventory_location_id'] = product.get('variant_inventory_location_id')
-                    variant['apply_inventory'] = True
-                if not variant.get('inventory_policy'):
-                    variant['inventory_policy'] = 'CONTINUE'
         media_for_apply = copy.deepcopy(product.get('media') or [])
         ai_alt_text = metadata.get('alt_text', '')
         if media_for_apply and ai_alt_text:
@@ -11163,6 +11187,7 @@ def _run_csv_enhance_job(job_id, shop_domain=None, access_token=None):
                 return
             job['_thread_running'] = True
             job['status'] = 'processing'
+            job['phase'] = 'enhance'
             job['current_step'] = 'Starting AI enhancement...'
             job['updated_at'] = datetime.now().isoformat()
 
@@ -11178,6 +11203,10 @@ def _run_csv_enhance_job(job_id, shop_domain=None, access_token=None):
             with csv_enhance_jobs_lock:
                 job = csv_enhance_jobs.get(job_id)
                 if not job or job.get('status') != 'processing':
+                    break
+                if job.get('cancel_requested'):
+                    job['status'] = 'cancelled'
+                    job['current_step'] = 'Cancelled after the last completed product.'
                     break
                 products = job.get('products', [])
                 index = int(job.get('current_index', 0))
@@ -11241,7 +11270,7 @@ def _run_csv_enhance_job(job_id, shop_domain=None, access_token=None):
                 job['current_index'] = index + 1
                 job['updated_at'] = datetime.now().isoformat()
                 job['_thread_running'] = False
-            _save_csv_enhance_jobs()
+            _save_csv_enhance_jobs(job_id)
 
             with csv_enhance_jobs_lock:
                 job = csv_enhance_jobs.get(job_id)
@@ -11253,7 +11282,7 @@ def _run_csv_enhance_job(job_id, shop_domain=None, access_token=None):
             if job:
                 job['_thread_running'] = False
                 job['updated_at'] = datetime.now().isoformat()
-        _save_csv_enhance_jobs()
+        _save_csv_enhance_jobs(job_id)
     except Exception as e:
         logger.error(f"Bulk CSV enhance job {job_id} crashed: {e}")
         with csv_enhance_jobs_lock:
@@ -11263,7 +11292,7 @@ def _run_csv_enhance_job(job_id, shop_domain=None, access_token=None):
                 job['status'] = 'error'
                 job['current_step'] = str(e)
                 _append_csv_job_log(job, f"Job crashed: {e}", 'error')
-        _save_csv_enhance_jobs()
+        _save_csv_enhance_jobs(job_id)
 
 
 def _run_csv_apply_job(job_id, shop_domain, access_token):
@@ -11276,28 +11305,39 @@ def _run_csv_apply_job(job_id, shop_domain, access_token):
                 return
             job['_thread_running'] = True
             job['status'] = 'applying'
+            job['phase'] = 'apply'
             job['current_step'] = 'Applying enhanced data to Shopify...'
             job.setdefault('apply_results', [])
             job['updated_at'] = datetime.now().isoformat()
+
+        originals_by_id = {(p.get('id') or p.get('product_id')): p for p in job.get('products', [])}
 
         while True:
             with csv_enhance_jobs_lock:
                 job = csv_enhance_jobs.get(job_id)
                 if not job or job.get('status') != 'applying':
                     break
+                if job.get('cancel_requested'):
+                    job['status'] = 'cancelled'
+                    job['current_step'] = 'Cancelled after the last completed product.'
+                    break
                 enhancements = job.get('enhancements', [])
                 index = int(job.get('apply_index', 0))
                 if index >= len(enhancements):
-                    job['status'] = 'applied'
+                    job['status'] = 'applied_with_errors' if any(not r.get('success') for r in job.get('apply_results', [])) else 'applied'
                     job['current_step'] = 'Shopify apply complete.'
                     job['updated_at'] = datetime.now().isoformat()
                     _append_csv_job_log(job, 'Shopify apply complete.', 'success')
                     break
-                enhanced = _resolve_enhanced_category(enhancements[index].get('enhanced') or {})
+                proposal = enhancements[index].get('enhanced') or {}
+                original = originals_by_id.get(proposal.get('product_id'))
+                if original is None:
+                    raise ValueError('Missing original product for this proposal; refresh and review again')
+                enhanced = _resolve_enhanced_category(build_product_patch(proposal, original, job.get('settings', {}).get('only_fields')))
                 product_id = enhanced.get('product_id')
                 # A column-scoped run only writes the products the AI actually
                 # changed, so untouched listings are never re-saved.
-                if enhanced.get('_no_change'):
+                if set(enhanced) <= {'product_id'}:
                     job.setdefault('apply_results', []).append({
                         'success': True,
                         'skipped': True,
@@ -11310,6 +11350,9 @@ def _run_csv_apply_job(job_id, shop_domain, access_token):
                     continue
                 job['current_step'] = f"Applying {index + 1} of {len(enhancements)}: {enhanced.get('title') or enhanced.get('handle') or product_id}"
 
+            with csv_enhance_jobs_lock:
+                job['in_flight'] = {'index': index, 'product_id': product_id}
+            _save_csv_enhance_jobs(job_id)
             if product_id:
                 result = update_product_seo_metadata(product_id, enhanced, shop_domain=shop_domain, access_token=access_token)
                 if result.get('success'):
@@ -11327,6 +11370,7 @@ def _run_csv_apply_job(job_id, shop_domain, access_token):
                     break
                 result['title'] = enhanced.get('title') or enhanced.get('handle') or product_id or 'Unknown product'
                 result['product_id'] = product_id
+                job.pop('in_flight', None)
                 job.setdefault('apply_results', []).append(result)
                 job['apply_index'] = index + 1
                 job['updated_at'] = datetime.now().isoformat()
@@ -11334,7 +11378,7 @@ def _run_csv_apply_job(job_id, shop_domain, access_token):
                     _append_csv_job_log(job, f"Applied {result['title']} to Shopify.", 'success')
                 else:
                     _append_csv_job_log(job, f"Apply failed for {result['title']}: {result.get('error')}", 'error')
-            _save_csv_enhance_jobs()
+            _save_csv_enhance_jobs(job_id)
             time.sleep(0.2)
 
         with csv_enhance_jobs_lock:
@@ -11342,7 +11386,7 @@ def _run_csv_apply_job(job_id, shop_domain, access_token):
             if job:
                 job['_thread_running'] = False
                 job['updated_at'] = datetime.now().isoformat()
-        _save_csv_enhance_jobs()
+        _save_csv_enhance_jobs(job_id)
     except Exception as e:
         logger.error(f"Bulk CSV apply job {job_id} crashed: {e}")
         with csv_enhance_jobs_lock:
@@ -11352,10 +11396,9 @@ def _run_csv_apply_job(job_id, shop_domain, access_token):
                 job['status'] = 'error'
                 job['current_step'] = str(e)
                 _append_csv_job_log(job, f"Apply job crashed: {e}", 'error')
-        _save_csv_enhance_jobs()
+        _save_csv_enhance_jobs(job_id)
 
 
-_load_csv_enhance_jobs()
 
 
 @app.route('/api/bulk_seo_jobs', methods=['POST'])
@@ -11418,7 +11461,7 @@ def create_bulk_seo_job():
         _append_csv_job_log(job, f"Queued {len(products)} products using {model_name}; one vision call per attempt.", 'info')
         with csv_enhance_jobs_lock:
             csv_enhance_jobs[job_id] = job
-        _save_csv_enhance_jobs()
+        _save_csv_enhance_jobs(job_id)
 
         thread = threading.Thread(
             target=_run_csv_enhance_job,
@@ -11437,11 +11480,12 @@ def create_bulk_seo_job():
 @app.route('/api/bulk_seo_jobs/<job_id>', methods=['GET'])
 @login_required
 def get_bulk_seo_job(job_id):
+    _ensure_csv_job_loaded(job_id)
     with csv_enhance_jobs_lock:
         job = csv_enhance_jobs.get(job_id)
         if not job or job.get('user_id') != current_user.id:
             return jsonify({'success': False, 'error': 'Job not found'}), 404
-        return jsonify({'success': True, 'job': _csv_job_public(job)})
+        return jsonify({'success': True, 'job': _csv_job_public(job, summary=request.args.get('summary') == '1')})
 
 
 
@@ -11493,9 +11537,25 @@ def download_bulk_edit_snapshot(snapshot_id):
     response.headers['Content-Type'] = 'application/json; charset=utf-8'
     response.headers['Content-Disposition'] = f'attachment; filename=listing-cannon-recovery-{snapshot.id}.json'
     return response
+@app.route('/api/bulk_seo_jobs/<job_id>/cancel', methods=['POST'])
+@login_required
+def cancel_bulk_seo_job(job_id):
+    _ensure_csv_job_loaded(job_id)
+    with csv_enhance_jobs_lock:
+        job = csv_enhance_jobs.get(job_id)
+        if not job or job.get('user_id') != current_user.id:
+            return jsonify({'success': False, 'error': 'Job not found'}), 404
+        if job.get('status') in ('queued', 'processing', 'applying'):
+            job['cancel_requested'] = True
+            job['current_step'] = 'Cancellation requested; finishing the current product.'
+    _save_csv_enhance_jobs(job_id)
+    return jsonify({'success': True})
+
+
 @app.route('/api/bulk_seo_jobs/<job_id>/resume', methods=['POST'])
 @login_required
 def resume_bulk_seo_job(job_id):
+    _ensure_csv_job_loaded(job_id)
     try:
         shop = get_current_shop()
         shop_domain = shop.shop_domain if shop else None
@@ -11506,15 +11566,21 @@ def resume_bulk_seo_job(job_id):
                 return jsonify({'success': False, 'error': 'Job not found'}), 404
             if _bulk_job_shop_mismatch(job, shop):
                 return jsonify({'success': False, 'error': 'This job belongs to a different Shopify store. Switch back to that store first.'}), 409
-            if job.get('status') not in ('queued', 'paused', 'error'):
+            if job.get('_thread_running') or job.get('status') not in ('paused', 'error'):
                 return jsonify({'success': False, 'error': f"Job cannot resume from {job.get('status')}"}), 400
-            job['status'] = 'queued'
+            if job.get('in_flight'):
+                return jsonify({'success': False, 'error': 'Interrupted Shopify write: refresh and reconcile the affected product before creating a new proposal.'}), 409
+            applying = job.get('phase') == 'apply'
+            if applying and not shop:
+                return jsonify({'success': False, 'error': 'Connect the original Shopify store first.'}), 400
+            job['status'] = 'applying' if applying else 'queued'
             job['current_step'] = 'Resuming...'
+        _save_csv_enhance_jobs(job_id)
         thread = threading.Thread(
-            target=_run_csv_enhance_job,
+            target=_run_csv_apply_job if applying else _run_csv_enhance_job,
             args=(job_id, shop_domain, access_token),
             daemon=True,
-            name=f"csv-enhance-{job_id[:8]}",
+            name=f"csv-resume-{job_id[:8]}",
         )
         thread.start()
         return jsonify({'success': True})
@@ -11526,79 +11592,59 @@ def resume_bulk_seo_job(job_id):
 @app.route('/api/bulk_seo_jobs/<job_id>/apply', methods=['POST'])
 @login_required
 def apply_bulk_seo_job(job_id):
+    _ensure_csv_job_loaded(job_id)
     try:
         shop = get_current_shop()
         if not shop:
             return jsonify({'success': False, 'error': 'No Shopify store connected. Connect a store first.'}), 400
         data = request.get_json(silent=True) or {}
-        edited_enhancements = data.get('enhancements')
         with csv_enhance_jobs_lock:
             job = csv_enhance_jobs.get(job_id)
             if not job or job.get('user_id') != current_user.id:
                 return jsonify({'success': False, 'error': 'Job not found'}), 404
             if _bulk_job_shop_mismatch(job, shop):
-                return jsonify({'success': False, 'error': 'This job belongs to a different Shopify store. Switch back to that store first.'}), 409
-            # Bind jobs made before this safeguard was introduced on first use.
-            if not job.get('shop_id'):
-                job['shop_id'] = shop.id
-                job['shop_domain'] = shop.shop_domain
-            if isinstance(edited_enhancements, list) and edited_enhancements:
-                job['enhancements'] = edited_enhancements
-            if not job.get('enhancements'):
+                return jsonify({'success': False, 'error': 'Switch back to the Shopify store that owns this job.'}), 409
+            if job.get('in_flight'):
+                return jsonify({'success': False, 'error': 'A Shopify write was interrupted. Refresh and reconcile the affected product before creating a new proposal.'}), 409
+            if job.get('_thread_running') or job.get('status') not in ('enhanced', 'error'):
+                return jsonify({'success': False, 'error': 'This batch is running or already finished. Create a new proposal for further changes.'}), 409
+            candidate = data.get('enhancements', job.get('enhancements'))
+            if not isinstance(candidate, list) or not candidate:
                 return jsonify({'success': False, 'error': 'No enhanced products to apply'}), 400
-            enhancement_count = len(job.get('enhancements') or [])
-            expected_confirmation = f"APPLY {enhancement_count}"
-            if data.get('confirmation') != expected_confirmation:
-                return jsonify({
-                    'success': False,
-                    'error': f"Confirmation required. Type {expected_confirmation} exactly.",
-                }), 400
-            replacements = [
-                item for item in job.get('enhancements') or []
-                if str((item.get('enhanced') or {}).get('variant_mode') or '').lower() == 'replace'
-            ]
-            if replacements and data.get('variant_replacement_confirmation') != 'REPLACE VARIANTS':
-                return jsonify({
-                    'success': False,
-                    'error': 'Variant replacement requires the additional confirmation REPLACE VARIANTS.',
-                }), 400
-            if not job.get('snapshot_id'):
-                products = job.get('products') or []
-                originals = []
-                for item in job.get('enhancements') or []:
-                    original_index = item.get('originalIndex')
-                    target_id = (item.get('enhanced') or {}).get('product_id')
-                    original = next(
-                        (p for p in products if (p.get('id') or p.get('product_id')) == target_id),
-                        None,
-                    )
-                    if original is None:
-                        original = next(
-                            (p for p in products if str(p.get('originalIndex')) == str(original_index)),
-                            None,
-                        )
-                    if original:
-                        originals.append(original)
-                job['snapshot_id'] = _create_bulk_edit_snapshot(
-                    shop, originals, job_id=job_id, retention_days=90
-                )
-            if job.get('status') not in ('enhanced', 'applied', 'error'):
-                return jsonify({'success': False, 'error': f"Job cannot apply from {job.get('status')}"}), 400
-            if job.get('status') == 'applied':
-                job['apply_index'] = 0
-                job['apply_results'] = []
-        _save_csv_enhance_jobs()
-        thread = threading.Thread(
-            target=_run_csv_apply_job,
-            args=(job_id, shop.shop_domain, shop.access_token),
-            daemon=True,
-            name=f"csv-apply-{job_id[:8]}",
-        )
-        thread.start()
+            if job.get('apply_index', 0) and candidate != job.get('enhancements'):
+                return jsonify({'success': False, 'error': 'Create a new proposal to change a batch that has already started applying.'}), 409
+            expected = f'APPLY {len(candidate)}'
+            if data.get('confirmation') != expected:
+                return jsonify({'success': False, 'error': f'Confirmation required: {expected}'}), 400
+            if any(str((item.get('enhanced') or {}).get('variant_mode', '')).lower() == 'replace' for item in candidate):
+                if data.get('variant_replacement_confirmation') != 'REPLACE VARIANTS':
+                    return jsonify({'success': False, 'error': 'Variant replacement requires REPLACE VARIANTS confirmation.'}), 400
+            by_id = {(p.get('id') or p.get('product_id')): p for p in job.get('products', [])}
+            originals = []
+            seen = set()
+            for item in candidate:
+                proposal = item.get('enhanced') or {}
+                product_id = proposal.get('product_id')
+                if product_id not in by_id or product_id in seen:
+                    return jsonify({'success': False, 'error': 'Each proposal must match one original product, without duplicates.'}), 400
+                original = by_id[product_id]
+                build_product_patch(proposal, original, job.get('settings', {}).get('only_fields'))
+                originals.append(original)
+                seen.add(product_id)
+            snapshot_id = job.get('snapshot_id') or _create_bulk_edit_snapshot(
+                shop, originals, job_id=job_id, retention_days=90)
+            job.update(enhancements=candidate, snapshot_id=snapshot_id, shop_id=shop.id,
+                       shop_domain=shop.shop_domain, status='applying', phase='apply', _persist_reset=True)
+        _save_csv_enhance_jobs(job_id)
+        threading.Thread(target=_run_csv_apply_job, args=(job_id, shop.shop_domain, shop.access_token),
+                         daemon=True, name=f'csv-apply-{job_id[:8]}').start()
         return jsonify({'success': True})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Apply bulk SEO job error: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/enhance_csv_product', methods=['POST'])
 @login_required
@@ -11924,53 +11970,36 @@ def apply_enhanced_shopify_products():
                 'success': False,
                 'error': 'A complete before-state is required before live Shopify changes can start.',
             }), 400
-        snapshot_id = _create_bulk_edit_snapshot(shop, originals, retention_days=90)
-        results = []
-        success_count = 0
-        failed_count = 0
-
+        originals_by_id = {(p.get('id') or p.get('product_id')): p for p in originals}
+        seen = set()
         for item in enhancements:
-            enhanced = _resolve_enhanced_category(item.get('enhanced') or {})
-            product_id = enhanced.get('product_id') or item.get('product_id')
-            if not product_id:
-                failed_count += 1
-                results.append({
-                    'success': False,
-                    'title': enhanced.get('title') or enhanced.get('handle') or 'Unknown product',
-                    'error': 'Missing Shopify product id',
-                })
-                continue
+            proposal = item.get('enhanced') or {}
+            original = originals_by_id.get(proposal.get('product_id'))
+            if original is None or proposal.get('product_id') in seen:
+                return jsonify({'success': False, 'error': 'Missing matching original product; refresh and review again.'}), 400
+            seen.add(proposal.get('product_id'))
+            build_product_patch(proposal, original)
+        job_id = str(uuid.uuid4())
+        snapshot_id = _create_bulk_edit_snapshot(shop, originals, job_id=job_id, retention_days=90)
+        now = datetime.now().isoformat()
+        job = {
+            'job_id': job_id, 'user_id': current_user.id, 'source': 'shopify_api',
+            'shop_id': shop.id, 'shop_domain': shop.shop_domain,
+            'status': 'applying', 'products': originals, 'enhancements': enhancements,
+            'settings': {}, 'current_index': len(originals), 'apply_index': 0,
+            'apply_results': [], 'failures': [], 'logs': [], 'snapshot_id': snapshot_id,
+            'created_at': now, 'updated_at': now, 'current_step': 'Starting Shopify apply...',
+        }
+        with csv_enhance_jobs_lock:
+            csv_enhance_jobs[job_id] = job
+        _save_csv_enhance_jobs(job_id)
+        threading.Thread(target=_run_csv_apply_job,
+                         args=(job_id, shop.shop_domain, shop.access_token),
+                         daemon=True, name=f'csv-apply-{job_id[:8]}').start()
+        return jsonify({'success': True, 'job_id': job_id, 'snapshot_id': snapshot_id}), 202
 
-            result = update_product_seo_metadata(
-                product_id,
-                enhanced,
-                shop_domain=shop.shop_domain,
-                access_token=shop.access_token,
-            )
-            if result.get('success'):
-                _apply_category_attribute_metafields(
-                    enhanced,
-                    shop_domain=shop.shop_domain,
-                    access_token=shop.access_token,
-                )
-            result['title'] = enhanced.get('title') or enhanced.get('handle') or product_id
-            result['product_id'] = product_id
-            results.append(result)
-            if result.get('success'):
-                success_count += 1
-            else:
-                failed_count += 1
-
-            # Keep direct writes gentle on Shopify and the Render process.
-            time.sleep(0.2)
-
-        return jsonify({
-            'success': failed_count == 0,
-            'success_count': success_count,
-            'snapshot_id': snapshot_id,
-            'failed_count': failed_count,
-            'results': results,
-        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Apply enhanced Shopify products error: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -11978,302 +12007,25 @@ def apply_enhanced_shopify_products():
 @app.route('/generate_enhanced_csv', methods=['POST'])
 @login_required
 def generate_enhanced_csv():
-    """Generate enhanced CSV by merging AI metadata with original CSV.
-    
-    Supports optional variant override mode: when variant_override_enabled is True,
-    all existing variant rows are stripped and replaced with user-defined variants.
-    This effectively turns the CSV enhancement into a bulk repricing tool.
-    """
-    import csv
-    import io
-    
+    """Export reviewed product groups without duplicating or dropping variants."""
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'success': False, 'error': 'No data provided'}), 400
-        
-        original_csv = data.get('original_csv', {})
-        enhancements = data.get('enhancements', [])
-        field_settings = data.get('field_settings', {})
-        use_main_image_per_variant = data.get('use_main_image_per_variant', False)
-        
-        # Variant override parameters
-        variant_override_enabled = data.get('variant_override_enabled', False)
-        variant_option_name = data.get('variant_option_name', 'Size').strip() or 'Size'
-        variant_definitions = data.get('variant_definitions', [])  # [{name, price, quantity}]
-        variant_inventory_policy = data.get('variant_inventory_policy', 'deny')
-        
-        headers = list(original_csv.get('headers', []))
-        rows = original_csv.get('rows', [])
-        
-        if not headers or not rows:
-            return jsonify({'success': False, 'error': 'Invalid CSV data'}), 400
-        
-        if variant_override_enabled:
-            logger.info(f"Variant override enabled: {len(variant_definitions)} variant(s), option='{variant_option_name}', policy='{variant_inventory_policy}'")
-        
-        # Build a map of handle -> main listing image (Image Src from the first row per handle)
-        # Used when use_main_image_per_variant is True to copy the main image to every variant row
-        main_image_by_handle = {}
-        if use_main_image_per_variant:
-            for row in rows:
-                handle = row.get('Handle', '').strip()
-                if handle and handle not in main_image_by_handle:
-                    image_src = row.get('Image Src', '').strip()
-                    if image_src:
-                        main_image_by_handle[handle] = image_src
-            logger.info(f"Main image per variant enabled - found images for {len(main_image_by_handle)} products")
-        
-        # Ensure all columns we want to write exist in the headers
-        # Map of enhanced_data keys -> CSV column names
-        extra_columns = {
-            'Collection': 'collections',
-            'Google Shopping / Google Product Category': 'google_product_category',
-            'Google Shopping / Gender': 'gender',
-            'Google Shopping / Age Group': 'age_group',
-            'Google Shopping / Condition': 'condition',
-            'Google Shopping / Custom Product': 'custom_product',
-            'Google Shopping / Custom Label 0': 'custom_label_0',
-            'Google Shopping / Custom Label 1': 'custom_label_1',
-            'Google Shopping / Custom Label 2': 'custom_label_2',
-            'Google Shopping / Custom Label 3': 'custom_label_3',
-            'Google Shopping / Custom Label 4': 'custom_label_4',
-            # Product metafields (Shopify CSV import format)
-            'Metafield: custom.color [single_line_text_field]': 'metafield_color',
-            'Metafield: custom.theme [single_line_text_field]': 'metafield_theme',
-            'Metafield: custom.frame_style [single_line_text_field]': 'metafield_frame_style',
-            'Metafield: custom.condition [single_line_text_field]': 'metafield_condition',
-            'Metafield: custom.decoration_material [single_line_text_field]': 'metafield_decoration_material',
-            'Metafield: custom.artwork_frame_material [single_line_text_field]': 'metafield_artwork_frame_material',
-            'Google: Custom Product (product.metafields.mm-google-shopping.custom_product)': 'custom_product',
-            'Color (product.metafields.custom.color)': 'metafield_color',
-            'Frame Style (product.metafields.custom.frame_style)': 'metafield_frame_style',
-            'Theme (product.metafields.custom.theme)': 'metafield_theme',
-            'Art movement (product.metafields.shopify.art-movement)': 'metafield_art_movement',
-            'Art style (product.metafields.shopify.art-style)': 'metafield_art_style',
-            'Artwork authenticity (product.metafields.shopify.artwork-authenticity)': 'metafield_artwork_authenticity',
-            'Color (product.metafields.shopify.color-pattern)': 'metafield_color',
-            'Frame style (product.metafields.shopify.frame-style)': 'metafield_frame_style',
-            'Material (product.metafields.shopify.material)': 'metafield_material',
-            'Orientation (product.metafields.shopify.orientation)': 'metafield_orientation',
-            'Theme (product.metafields.shopify.theme)': 'metafield_theme',
-            'Metafield: global.title_tag [single_line_text_field]': 'seo_title',
-            'Metafield: global.description_tag [multi_line_text_field]': 'seo_description',
-            'Complementary products (product.metafields.shopify--discovery--product_recommendation.complementary_products)': 'mf__shopify--discovery--product_recommendation__complementary_products',
-            'Related products (product.metafields.shopify--discovery--product_recommendation.related_products)': 'mf__shopify--discovery--product_recommendation__related_products',
-            'Related products settings (product.metafields.shopify--discovery--product_recommendation.related_products_display)': 'mf__shopify--discovery--product_recommendation__related_products_display',
-            'Search product boosts (product.metafields.shopify--discovery--product_search_boost.queries)': 'mf__shopify--discovery--product_search_boost__queries',
-        }
-        for col_name in extra_columns:
-            if col_name not in headers:
-                headers.append(col_name)
-        
-        # When variant override is enabled, ensure variant-related columns exist in headers
-        if variant_override_enabled and variant_definitions:
-            variant_columns = [
-                'Option1 Name', 'Option1 Value',
-                'Variant SKU', 'Variant Price', 'Variant Inventory Qty',
-                'Variant Inventory Policy', 'Variant Fulfillment Service',
-                'Variant Requires Shipping', 'Variant Taxable',
-            ]
-            for vc in variant_columns:
-                if vc not in headers:
-                    headers.append(vc)
-        
-        enhancement_map = {}
-        for item in enhancements:
-            orig_index = item.get('originalIndex')
-            enhanced = item.get('enhanced', {})
-            handle = enhanced.get('handle', '')
-            if handle:
-                enhancement_map[handle] = enhanced
-        
-        # Standard column mapping: enhanced_data key -> CSV header name
-        column_map = [
-            ('title', 'Title'),
-            ('body_html', 'Body (HTML)'),
-            ('tags', 'Tags'),
-            ('product_category', 'Product Category'),
-            ('product_type', 'Type'),
-            ('seo_title', 'SEO Title'),
-            ('seo_description', 'SEO Description'),
-            ('vendor', 'Vendor'),
-            ('collections', 'Collection'),
-            ('google_product_category', 'Google Shopping / Google Product Category'),
-            ('gender', 'Google Shopping / Gender'),
-            ('age_group', 'Google Shopping / Age Group'),
-            ('condition', 'Google Shopping / Condition'),
-            ('custom_product', 'Google Shopping / Custom Product'),
-            ('custom_label_0', 'Google Shopping / Custom Label 0'),
-            ('custom_label_1', 'Google Shopping / Custom Label 1'),
-            ('custom_label_2', 'Google Shopping / Custom Label 2'),
-            ('custom_label_3', 'Google Shopping / Custom Label 3'),
-            ('custom_label_4', 'Google Shopping / Custom Label 4'),
-            # Product metafields
-            ('metafield_color', 'Metafield: custom.color [single_line_text_field]'),
-            ('metafield_theme', 'Metafield: custom.theme [single_line_text_field]'),
-            ('metafield_frame_style', 'Metafield: custom.frame_style [single_line_text_field]'),
-            ('metafield_condition', 'Metafield: custom.condition [single_line_text_field]'),
-            ('metafield_decoration_material', 'Metafield: custom.decoration_material [single_line_text_field]'),
-            ('metafield_artwork_frame_material', 'Metafield: custom.artwork_frame_material [single_line_text_field]'),
-            ('custom_product', 'Google: Custom Product (product.metafields.mm-google-shopping.custom_product)'),
-            ('metafield_color', 'Color (product.metafields.custom.color)'),
-            ('metafield_frame_style', 'Frame Style (product.metafields.custom.frame_style)'),
-            ('metafield_theme', 'Theme (product.metafields.custom.theme)'),
-            ('metafield_art_movement', 'Art movement (product.metafields.shopify.art-movement)'),
-            ('metafield_art_style', 'Art style (product.metafields.shopify.art-style)'),
-            ('metafield_artwork_authenticity', 'Artwork authenticity (product.metafields.shopify.artwork-authenticity)'),
-            ('metafield_color', 'Color (product.metafields.shopify.color-pattern)'),
-            ('metafield_frame_style', 'Frame style (product.metafields.shopify.frame-style)'),
-            ('metafield_material', 'Material (product.metafields.shopify.material)'),
-            ('metafield_orientation', 'Orientation (product.metafields.shopify.orientation)'),
-            ('metafield_theme', 'Theme (product.metafields.shopify.theme)'),
-            ('seo_title', 'Metafield: global.title_tag [single_line_text_field]'),
-            ('seo_description', 'Metafield: global.description_tag [multi_line_text_field]'),
-            ('mf__shopify--discovery--product_recommendation__complementary_products', 'Complementary products (product.metafields.shopify--discovery--product_recommendation.complementary_products)'),
-            ('mf__shopify--discovery--product_recommendation__related_products', 'Related products (product.metafields.shopify--discovery--product_recommendation.related_products)'),
-            ('mf__shopify--discovery--product_recommendation__related_products_display', 'Related products settings (product.metafields.shopify--discovery--product_recommendation.related_products_display)'),
-            ('mf__shopify--discovery--product_search_boost__queries', 'Search product boosts (product.metafields.shopify--discovery--product_search_boost.queries)'),
-        ]
-        
-        enhanced_rows = []
-        current_handle = None
-        current_variant_counter = 0
-        
-        for row in rows:
-            handle = row.get('Handle', '').strip()
-            
-            # --- Variant override mode: skip all original variant rows ---
-            # Variant rows have an empty Handle; they belong to the previous product.
-            # We will inject replacement variants after processing the product row.
-            if variant_override_enabled and variant_definitions and not handle:
-                continue  # skip original variant row
-            
-            new_row = dict(row)
-            # Ensure all headers have a value (even empty) so DictWriter doesn't error
-            for h in headers:
-                if h not in new_row:
-                    new_row[h] = ''
-            
-            if handle:
-                current_handle = handle
-                current_variant_counter = 0
-            else:
-                current_variant_counter += 1
-            
-            if current_handle and current_handle in enhancement_map:
-                enhanced = enhancement_map[current_handle]
-                
-                if handle:
-                    source_columns = enhanced.get('source_columns') or {}
-                    if isinstance(source_columns, dict):
-                        for csv_col, val in source_columns.items():
-                            if csv_col not in headers:
-                                headers.append(csv_col)
-                            new_row[csv_col] = _ensure_string(val)
-                    # Apply enhanced values to product row (first row for this handle)
-                    for data_key, csv_col in column_map:
-                        if csv_col in headers:
-                            val = enhanced.get(data_key, '')
-                            if val:
-                                new_row[csv_col] = _ensure_string(val)
-                
-                if 'Image Alt Text' in headers and enhanced.get('image_alt_text'):
-                    new_row['Image Alt Text'] = enhanced['image_alt_text']
-                
-                # Apply variant SKU to all variant rows for this product
-                if 'Variant SKU' in headers and enhanced.get('variant_sku'):
-                    base_sku = enhanced['variant_sku']
-                    variant_suffix = f"-V{current_variant_counter}" if current_variant_counter > 0 else ""
-                    new_row['Variant SKU'] = f"{base_sku}{variant_suffix}"
-            
-            # Set main listing image on every variant row when option is enabled
-            if use_main_image_per_variant and current_handle and current_handle in main_image_by_handle:
-                if 'Image Src' in headers:
-                    new_row['Image Src'] = main_image_by_handle[current_handle]
-            
-            # --- Variant override: set Option1 on the product row (first variant) ---
-            if variant_override_enabled and variant_definitions and handle:
-                first_variant = variant_definitions[0]
-                new_row['Option1 Name'] = variant_option_name
-                new_row['Option1 Value'] = first_variant.get('name', '')
-                new_row['Variant Price'] = str(first_variant.get('price', '0'))
-                if 'Variant Inventory Qty' in headers:
-                    new_row['Variant Inventory Qty'] = str(first_variant.get('quantity', 0))
-                if 'Variant Inventory Policy' in headers:
-                    new_row['Variant Inventory Policy'] = variant_inventory_policy
-                if 'Variant Fulfillment Service' in headers:
-                    new_row['Variant Fulfillment Service'] = 'manual'
-                if 'Variant Requires Shipping' in headers:
-                    new_row['Variant Requires Shipping'] = 'TRUE'
-                if 'Variant Taxable' in headers:
-                    new_row['Variant Taxable'] = 'TRUE'
-                # SKU for first variant
-                if 'Variant SKU' in headers:
-                    enhanced = enhancement_map.get(current_handle, {})
-                    base_sku = enhanced.get('variant_sku', '')
-                    new_row['Variant SKU'] = base_sku if base_sku else ''
-            
-            enhanced_rows.append(new_row)
-            
-            # --- Variant override: inject additional variant rows after the product row ---
-            if variant_override_enabled and variant_definitions and handle and len(variant_definitions) > 1:
-                enhanced = enhancement_map.get(current_handle, {})
-                base_sku = enhanced.get('variant_sku', '')
-                product_image = main_image_by_handle.get(current_handle, '') if use_main_image_per_variant else ''
-                
-                for v_idx, v_def in enumerate(variant_definitions[1:], start=1):
-                    variant_row = {h: '' for h in headers}
-                    # Handle is empty for variant rows (Shopify CSV convention)
-                    variant_row['Handle'] = ''
-                    variant_row['Option1 Name'] = variant_option_name
-                    variant_row['Option1 Value'] = v_def.get('name', '')
-                    variant_row['Variant Price'] = str(v_def.get('price', '0'))
-                    if 'Variant Inventory Qty' in headers:
-                        variant_row['Variant Inventory Qty'] = str(v_def.get('quantity', 0))
-                    if 'Variant Inventory Policy' in headers:
-                        variant_row['Variant Inventory Policy'] = variant_inventory_policy
-                    if 'Variant Fulfillment Service' in headers:
-                        variant_row['Variant Fulfillment Service'] = 'manual'
-                    if 'Variant Requires Shipping' in headers:
-                        variant_row['Variant Requires Shipping'] = 'TRUE'
-                    if 'Variant Taxable' in headers:
-                        variant_row['Variant Taxable'] = 'TRUE'
-                    # SKU with variant suffix
-                    if 'Variant SKU' in headers and base_sku:
-                        variant_row['Variant SKU'] = f"{base_sku}-V{v_idx}"
-                    # Copy main image to variant row if option is enabled
-                    if use_main_image_per_variant and product_image:
-                        variant_row['Image Src'] = product_image
-                    
-                    enhanced_rows.append(variant_row)
-        
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=headers)
-        writer.writeheader()
-        writer.writerows(enhanced_rows)
-        
-        csv_content = output.getvalue()
-        
-        response = make_response(csv_content)
+        data = request.get_json(silent=True) or {}
+        response = make_response(transform_csv(data))
         response.headers['Content-Type'] = 'text/csv; charset=utf-8'
         response.headers['Content-Disposition'] = 'attachment; filename=shopify_enhanced_import.csv'
-        
-        if variant_override_enabled:
-            logger.info(f"Generated enhanced CSV with variant override: {len(enhanced_rows)} rows ({len(variant_definitions)} variants per product)")
-        else:
-            logger.info(f"Generated enhanced CSV with {len(enhanced_rows)} rows")
-        
         return response
-        
-    except Exception as e:
-        logger.error(f"Generate enhanced CSV error: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception('Generate enhanced CSV failed')
+        return jsonify({'success': False, 'error': str(exc)}), 500
 
 # Initialize database and auth after app is fully loaded (avoids circular import)
 with app.app_context():
     import models  # noqa: F401
+    import bulk_job_store  # Register durable bulk-job tables.
     db.create_all()
+    _load_csv_enhance_jobs()
     # Run comprehensive profile table migration (adds ALL missing columns)
     _ensure_profile_all_columns()
 import auth  # noqa: E402
